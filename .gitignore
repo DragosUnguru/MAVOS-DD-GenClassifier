@@ -3,3 +3,4 @@ __pycache__
 egs/exp/*
 **/__pycache__/
 src/__pycache__
+checkpoints/
