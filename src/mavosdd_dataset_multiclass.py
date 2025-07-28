@@ -12,6 +12,7 @@ import PIL
 import csv
 import random
 import time
+import pandas as pd
 from PIL import ImageEnhance
 
 class RandomCropAndResize:
@@ -39,12 +40,27 @@ class RandomColor:
 
 
 class MavosDD(Dataset):
-    def __init__(self, dataset, input_path, audio_conf, stage, num_frames=16):
+    def __init__(
+            self,
+            dataset,
+            input_path,
+            audio_conf,
+            stage,
+            num_frames=16,
+            class_name_to_idx={}):
         self.num_frames = num_frames
         self.stage = stage
 
         self.dataset = dataset
         self.input_path = input_path
+
+        self.class_name_to_idx = class_name_to_idx
+        self.num_classes = len(class_name_to_idx)
+
+        self.per_class_name_dataset_split = {
+            class_name: self.dataset.filter(lambda sample: sample["generative_method"] == class_name)
+            for class_name in self.class_name_to_idx
+        }
 
         print('Dataset has {:d} samples'.format(len(self.dataset)))
         self.num_samples = len(self.dataset)
@@ -197,44 +213,58 @@ class MavosDD(Dataset):
             frames = torch.zeros(self.num_frames, 3, 224, 224)
             
         return frames
-    
+
     def _augment_concat(self, index):
         sample = self.dataset[index]
-        video_name = os.path.join(self.input_path,sample["video_path"])
-        label = 0 if sample["label"] == "real" else 1
-        
-        index_1 = random.choice([i for i in range(len(self.dataset))])
-        sample_1 = self.dataset[index_1]
-        video_name_1 = os.path.join(self.input_path,sample_1["video_path"])
-        label_1 = 0 if sample_1["label"] == "real" else 1
 
+        # Extract features of the initial sample
+        class_name = sample["generative_method"]
+        label = self.class_name_to_idx[class_name]
+        video_name = os.path.join(self.input_path, sample["video_path"])
+
+        # Find another random sample from the same class as our sample
+        same_class_dataset = self.per_class_name_dataset_split[class_name]
+        index_1 = random.choice([i for i in range(len(same_class_dataset))])
+        sample_1 = same_class_dataset[index_1]
+        video_name_1 = os.path.join(self.input_path, sample_1["video_path"])
+
+        # Run validation
+        label_1 = self.class_name_to_idx[sample_1["generative_method"]]
+        assert label == label_1, "When augmenting data, the two samples should come from the same class"
+
+        # Concat the two samples
         fbank = self._concat_wav2fbank(video_name, video_name_1)
         frames = self._concat_get_frames(video_name, video_name_1)
 
         if self.stage == 1:
-            label_ = 0
-        else:
-            if int(label) == 0 and int(label_1) == 0:
-                label_ = 0
-            else:
-                label_ = 1
-        
-        return fbank, frames, label_
+            label = self.class_name_to_idx["real"]
+
+        return fbank, frames, label
 
     def _augment_replace(self, index):
         sample = self.dataset[index]
-        video_name = os.path.join(self.input_path,sample["video_path"])
-        label = 0 if sample["label"] == "real" else 1
-        # if int(label) == 0:
-        #     frames = self._get_frames(video_name)
-        #     fbank = self._wav2fbank(video_name)
-        #     return fbank, frames, label
-        # else:
-        label = 1
-        index_1 = random.choice([i for i in range(len(self.dataset))])
-        sample_1 = self.dataset[index_1]
-        video_name_1 = os.path.join(self.input_path,sample_1["video_path"])
-        label_1 = 0 if sample_1["label"] == "real" else 1
+
+        # Extract features of the initial sample
+        class_name = sample["generative_method"]
+        label = self.class_name_to_idx[class_name]
+        video_name = os.path.join(self.input_path, sample["video_path"])
+
+        if int(label) == self.class_name_to_idx["real"]:
+            # Augmenting a 'real' video would turn it in a 'fake' one
+            # Avoid augmenting real videos 
+            frames = self._get_frames(video_name)
+            fbank = self._wav2fbank(video_name)
+            return fbank, frames, label
+
+        # Find another random sample from the same class as our sample
+        same_class_dataset = self.per_class_name_dataset_split[class_name]
+        index_1 = random.choice([i for i in range(len(same_class_dataset))])
+        sample_1 = same_class_dataset[index_1]
+        video_name_1 = os.path.join(self.input_path, sample_1["video_path"])
+
+        # Run validation
+        label_1 = self.class_name_to_idx[sample_1["generative_method"]]
+        assert label == label_1, "When augmenting data, the two samples should come from the same class"
 
         # Replace audio with other
         frames = self._get_frames(video_name)
@@ -250,7 +280,8 @@ class MavosDD(Dataset):
         if show_time: start_time = time.time()
         
         video_name = os.path.join(self.input_path,sample["video_path"])
-        label = 0 if sample["label"] == "real" else 1
+        # label = 0 if sample["label"] == "real" else 1
+        label = self.class_name_to_idx[sample["generative_method"]]
 
         # Do not perform data augment under eval mode
         if self.mode == 'eval':
@@ -336,7 +367,8 @@ class MavosDD(Dataset):
         # frames: (T, C, H, W) -> (C, T, H, W)
         frames = frames.permute(1, 0, 2, 3)
         
-        label = torch.tensor([int(label), 1-int(label)]).float()
+        # label = torch.tensor([int(label), 1-int(label)]).float()
+        label = torch.nn.functional.one_hot(torch.tensor(label, dtype=torch.long), self.num_classes).float()
 
         return fbank, frames, label, sample["video_path"]
 
@@ -349,10 +381,50 @@ if __name__ == "__main__":
         'num_mel_bins': 128, 'target_length': 1024, 'freqm': 0, 'timem': 0, 'mode':'train', 
         'mean': -5.081, 'std': 4.4849, 'noise': False, 'label_smooth': 0, 'im_res': 224
     }
-    # dataset = MavosDD(input_path="/home/eivor/data/MAVOS-DD", audio_conf=audio_conf, stage=2)
-    # dataset[0]
+    class_name_to_label = {
+        'real': 0,
+        'echomimic': 1,
+        'hififace': 2,
+        'inswapper': 3,
+        'liveportrait': 4,
+        'memo': 5,
+        'roop': 6,
+        'sonic': 7,
+    }
 
-    mavos_dd = datasets.Dataset.load_from_disk("/home/eivor/data/MAVOS-DD")
+    input_path = "/mnt/d/projects/datasets/MAVOS-DD"
+    mavos_dd = datasets.Dataset.load_from_disk(input_path)
+    dataset = MavosDD(
+        # mavos_dd.filter(lambda sample: sample['split'] == 'validation'),
+        mavos_dd,
+        input_path=input_path,
+        audio_conf=audio_conf,
+        stage=2,
+        class_name_to_idx=class_name_to_label)
+
+    train_dataset = mavos_dd.filter(lambda sample: sample['split'] == 'train')
+    test_dataset = mavos_dd.filter(lambda sample: sample['split'] == 'test')
+    val_dataset = mavos_dd.filter(lambda sample: sample['split'] == 'validation')
+
+    def to_dataframe(dataset):
+        return pd.DataFrame({
+            "video_name": [f'{input_path}/{entry["video_path"]}' for entry in dataset],
+            "target": [0] * len(dataset)
+        })
+
+    train_df = to_dataframe(train_dataset)
+    test_df = to_dataframe(test_dataset)
+    val_df = to_dataframe(val_dataset)
+
+    # Step 3: Save to CSV
+    train_df.to_csv(os.path.join('..', 'data', "mavos-dd_train.csv"), index=False)
+    test_df.to_csv(os.path.join('..', 'data', "mavos-dd_test.csv"), index=False)
+    val_df.to_csv(os.path.join('..', 'data', "mavos-dd_validation.csv"), index=False)
+
+    print(mavos_dd[0])   # dataset features
+    print(dataset[0][2]) # label
+
+    # mavos_dd = datasets.Dataset.load_from_disk("/mnt/d/projects/datasets/MAVOS-DD")
     
     """
     # Train
@@ -373,14 +445,16 @@ if __name__ == "__main__":
     print(f"Test open: ", len(mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==True and sample["open_set_language"]==True)))
     """
     
-    print(len(mavos_dd))
+    # print(len(mavos_dd))
     
-    mavos_dd.filter(lambda sample: sample['split']=="train")
+    # mavos_dd.filter(lambda sample: sample['split']=="train")
     
-    print(len(mavos_dd))
+    # print(len(mavos_dd))
+
+    # print(mavos_dd[0])
     
     # train_loader = DataLoader(
-    #     MavosDD(mavos_dd.filter(lambda sample: sample['split']=="train"), "/home/eivor/data/MAVOS-DD", audio_conf, stage=2),
+    #     MavosDD(mavos_dd.filter(lambda sample: sample['split']=="train"), "/mnt/d/projects/datasets/MAVOS-DD", audio_conf, stage=2),
     #     batch_size=32, shuffle=True, num_workers=2, pin_memory=True, drop_last=True
     # )
 
