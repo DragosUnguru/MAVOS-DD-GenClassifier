@@ -1,10 +1,18 @@
 import argparse
 import datasets
+import cv2
 import torch
+import numpy as np
 from torch.utils.data import DataLoader
 
 from models.video_cav_mae import VideoCAVMAEFT
 from mavosdd_dataset import MavosDD
+
+from pytorch_grad_cam import GradCAM, HiResCAM, ScoreCAM, GradCAMPlusPlus, AblationCAM, XGradCAM, EigenCAM, FullGrad
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget, RawScoresOutputTarget
+from pytorch_grad_cam.utils.image import (
+    show_cam_on_image, deprocess_image, preprocess_image
+)
 
 parser = argparse.ArgumentParser(description='Video CAV-MAE')
 
@@ -62,6 +70,47 @@ miss, unexpected = cavmae_ft.load_state_dict(mdl_weight, strict=False)
 
 print("Missing: ", miss)
 print("Unexpected: ", unexpected)
-print('now load pretrain model from {:s}, missing keys: {:d}, unexpected keys: {:d}'.format(args.model_weights_path, len(miss), len(unexpected)))
 
-print(cavmae_ft)
+target_layers = [cavmae_ft.module.visual_encoder.patch_embedding.projection]
+audio_input, video_input, labels, video_path = next(iter(test_loader))
+# Note: input_tensor can be a batch tensor with several images!
+
+# We have to specify the target we want to generate the CAM for.
+# targets = [RawScoresOutputTarget()]
+class FeatureSumTarget:
+    def __call__(self, model_output):
+        return model_output.sum()
+
+targets = [FeatureSumTarget()]
+
+mid_frame_idx = video_input.shape[1] // 2
+frame = video_input[0, :, mid_frame_idx, :, :].clone()
+
+mean=[0.4850, 0.4560, 0.4060]
+std=[0.2290, 0.2240, 0.2250]
+
+for t, m, s in zip(frame, mean, std):
+    t.mul_(s).add_(m)
+
+rgb_img = frame.permute(1, 2, 0).cpu().numpy()
+rgb_img = np.clip(rgb_img, 0, 1).astype(np.float32)
+
+# Construct the CAM object once, and then re-use it on many images.
+with GradCAM(model=cavmae_ft.module.visual_encoder, target_layers=target_layers) as cam:
+    # video_input = video_input.permute(0, 2, 1, 3, 4)
+    grayscale_cam = cam(input_tensor=video_input, targets=targets)
+    cam_for_frame = grayscale_cam[0, grayscale_cam.shape[1] // 2]
+
+    # print(grayscale_cam.shape)
+    # print('===========')
+    # print(grayscale_cam)
+
+    visualization = show_cam_on_image(rgb_img, cam_for_frame, use_rgb=True)
+    visualization = cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR)
+
+    # You can also get the model outputs without having to redo inference
+    # model_outputs = cam.outputs
+    cv2.imwrite('/mnt/d/projects/MAVOS-DD-GenClassifer/exp/cam.jpg', visualization)
+
+# print('now load pretrain model from {:s}, missing keys: {:d}, unexpected keys: {:d}'.format(args.model_weights_path, len(miss), len(unexpected)))
+# print(cavmae_ft)
