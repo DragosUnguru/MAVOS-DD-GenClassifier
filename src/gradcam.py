@@ -2,6 +2,7 @@ import argparse
 import datasets
 import cv2
 import torch
+import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
 
@@ -11,6 +12,9 @@ from mavosdd_dataset import MavosDD
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 
+from custom_cam import MyGradCAM
+
+import matplotlib.cm as cm
 
 # Custom target we want to generate the CAM for.
 # Simple sum of activations as the video module has no classification layer
@@ -18,6 +22,74 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 class FeatureSumTarget:
     def __call__(self, model_output):
         return model_output.sum()
+
+# Custom target we want to generate the CAM for.
+# Simple argmax of activations on the last dimension
+# Suitable for audio module
+class FeatureArgMaxTarget:
+    def __call__(self, model_output):
+        return model_output.arg_max(dim=1)
+
+
+def dump_cam_to_disk(visualizations, dump_file_path):
+    if isinstance(visualizations, list):
+        # Multiple frames. Dump video to disk
+        height, width, _ = visualizations[0].shape
+        out = cv2.VideoWriter(dump_file_path, cv2.VideoWriter_fourcc(*'mp4v'), 10, (width, height))
+
+        for vis in visualizations:
+            for _ in range(8): # Repeat each frame several times for better visualisation in video playback
+                out.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+        out.release()
+    else:
+        # Single frame. Dump image to disk
+        cv2.imwrite(dump_file_path, visualizations)
+
+def audio_gradcam_show(
+    model,
+    input_tensor,
+    target_layers,
+    targets=[FeatureArgMaxTarget()],
+    dump_file_path='/mnt/d/projects/MAVOS-DD-GenClassifer/exp/gradcam_audio.jpg'
+):
+    # =============================================
+    # input_tensor: torch.Size([batch_size x 1024 x 128])
+    # =============================================
+
+    # def reshape_transform(tensor):
+        # print(f'Got tensor of shape: {tensor.shape}')
+        # H, W = 64, 8
+        # B, N, C = tensor.shape
+        # assert N == H * W, f"Expected {H*W} tokens, got {N}"
+        # tensor = tensor.permute(0, 2, 1).reshape(B, C, H, W)
+        # print(f'Returning tensor of shape: {tensor.shape}')
+        # return tensor
+
+    class AudioWrapper(nn.Module):
+        def __init__(self, audio_model):
+            super().__init__()
+            self.audio_model = audio_model
+
+        def forward(self, x):
+            # Remove the fake channel before passing to real model
+            # x: [B, 1, H, W]
+            x = x.squeeze(1)  # back to [B, H, W]
+            return self.audio_model(x)
+
+    wrapped_model = AudioWrapper(model)
+    fake_input = input_tensor.unsqueeze(1)  # [B, 1, H, W]
+
+    with GradCAM(model=wrapped_model, target_layers=target_layers) as cam:
+        grayscale_cam = cam(input_tensor=fake_input, targets=targets)
+        grayscale_cam = grayscale_cam[0]
+
+        # Convert original spectrogram to 3-channel image for overlay
+        spec = input_tensor[0].cpu().numpy()
+        spec_img = (spec - spec.min()) / (spec.max() - spec.min() + 1e-8)
+        spec_img = np.stack([spec_img] * 3, axis=-1)
+
+        visualization = show_cam_on_image(spec_img, grayscale_cam, use_rgb=True)
+        dump_cam_to_disk(visualization, dump_file_path)
 
 
 '''
@@ -45,7 +117,7 @@ def visual_gradcam_show(
     # grayscale_cam: (224, 224)
     # =============================================
 
-    temporal_dimension_size = input_tensor.shape[1]
+    temporal_dimension_size = input_tensor.shape[2]
 
     # Denormalize the input
     def denormalize_tensor(frame):
@@ -72,14 +144,7 @@ def visual_gradcam_show(
             visualization = show_cam_on_image(rgb_img_collection[temporal_idx], grayscale_cam, use_rgb=True)
             all_visualizations.append(visualization)
 
-    # Dump video to disk
-    height, width, _ = all_visualizations[0].shape
-    out = cv2.VideoWriter(dump_file_path, cv2.VideoWriter_fourcc(*'mp4v'), 10, (width, height))
-
-    for vis in all_visualizations:
-        for _ in range(8): # Repeat each frame several times for better visualisation in video playback
-            out.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-    out.release()
+    dump_cam_to_disk(all_visualizations, dump_file_path)
 
 
 if __name__ == '__main__':
@@ -130,14 +195,29 @@ if __name__ == '__main__':
     print('Missing: ', miss)
     print('Unexpected: ', unexpected)
 
-    # Select frame(s) to generate CAM for & select layer to use
-    target_layers = [cavmae_ft.module.visual_encoder.patch_embedding.projection]
+    # Select frame(s) to generate CAM for
     audio_input, video_input, labels, video_path = next(iter(test_loader))
+    output_file_name_prefix = 'fake' if labels[0][0] == 0 else 'real'
 
-    visual_gradcam_show(
-        model=cavmae_ft.module.visual_encoder,
-        input_tensor=video_input,
-        target_layers=target_layers,
+    # print(audio_input.shape)
+    # print('====== AUDIO ENCODER ======')
+    # print(cavmae_ft.module.audio_encoder)
+    # print('\n====== VIDEO ENCODER ======')
+    # print(cavmae_ft.module.visual_encoder)
+    # print('\n====== MLP ======')
+    # print(cavmae_ft.module.mlp_head)
+    
+    # visual_gradcam_show(
+    #     model=cavmae_ft.module.visual_encoder,
+    #     input_tensor=video_input,
+    #     target_layers=[cavmae_ft.module.visual_encoder.patch_embedding.projection],
+    #     targets=[FeatureSumTarget()],
+    #     dump_file_path=f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{output_file_name_prefix}_gradcam_video.mp4'
+    # )
+    audio_gradcam_show(
+        model=cavmae_ft.module.audio_encoder,
+        input_tensor=audio_input,
+        target_layers=[cavmae_ft.module.audio_encoder.patch_embed.proj],
         targets=[FeatureSumTarget()],
-        dump_file_path=f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{'fake' if labels[0][0] == 0 else 'real'}_gradcam_video.mp4'
+        dump_file_path=f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{output_file_name_prefix}_gradcam_audio.jpg'
     )
