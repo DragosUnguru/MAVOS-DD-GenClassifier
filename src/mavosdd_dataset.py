@@ -335,7 +335,6 @@ class MavosDD(Dataset):
         # fbank shape is [time_frame_num, frequency_bins], e.g., [1024, 128]
         # frames: (T, C, H, W) -> (C, T, H, W)
         frames = frames.permute(1, 0, 2, 3)
-        
         label = torch.tensor([int(label), 1-int(label)]).float()
 
         return fbank, frames, label, sample["video_path"]

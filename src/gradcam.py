@@ -10,6 +10,7 @@ from models.video_cav_mae import VideoCAVMAEFT
 from mavosdd_dataset import MavosDD
 
 from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget, BinaryClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
 
 from custom_cam import MyGradCAM
@@ -147,6 +148,80 @@ def visual_gradcam_show(
     dump_cam_to_disk(all_visualizations, dump_file_path)
 
 
+'''
+    Generates the CAM visualisation for the given model and model's input tensor.
+    The output is a .mp4 video of the 16 frames (in AVFF's case) of the first entry from the batch
+    (i.e. batch size is ignored and the CAM is generated exclusively for the first entry in the batch).
+'''
+def gradcam_show(
+    model,
+    input_video,
+    input_audio,
+    target_layers,
+    targets,
+    dump_file_path='/mnt/d/projects/MAVOS-DD-GenClassifer/exp/gradcam_video.mp4',
+    norm_mean=[0.4850, 0.4560, 0.4060],
+    norm_std=[0.2290, 0.2240, 0.2250]
+):
+    # =============================================
+    # input_tensor: torch.Size([batch_size x rgb_channels x num_frames x height x width)
+    # input_tensor: torch.Size([32, 3, 16, 224, 224])
+
+    # rgb_img: (height x width x rgb_channels)
+    # rgb_img: (224, 224, 3)
+
+    # grayscale_cam: (height x width)
+    # grayscale_cam: (224, 224)
+    # =============================================
+
+    temporal_dimension_size = input_video.shape[2]
+
+    # Denormalize the input
+    def denormalize_tensor(frame):
+        for tensor, mean, std in zip(frame, norm_mean, norm_std):
+            tensor.mul_(std).add_(mean)
+        return frame
+
+    rgb_img_collection = []
+    for temporal_idx in range(temporal_dimension_size):
+        rgb_img = input_video[0, :, temporal_idx, :, :].clone()
+        rgb_img = denormalize_tensor(rgb_img)
+        rgb_img = rgb_img.permute(1, 2, 0).cpu().numpy()
+        rgb_img = np.clip(rgb_img, 0, 1).astype(np.float32)
+
+        rgb_img_collection.append(rgb_img)
+
+    class ModelWrapper(nn.Module):
+        def __init__(self, model, fixed_video_tensor = None, fixed_audio_tensor = None):
+            super().__init__()
+
+            assert (fixed_video_tensor is None) != (fixed_audio_tensor is None), "There must be just one fixed tensor"
+
+            self.model = model
+            self.fixed_video_tensor = fixed_video_tensor
+            self.fixed_audio_tensor = fixed_audio_tensor
+
+        def forward(self, dynamic_tensor):
+            if self.fixed_audio_tensor is not None:
+                return self.model(self.fixed_audio_tensor, dynamic_tensor)
+            elif self.fixed_video_tensor is not None:
+                return self.model(dynamic_tensor, self.fixed_video_tensor)
+
+    # Generate CAM visualizations and save to disk
+    wrapped_model = ModelWrapper(model, fixed_audio_tensor=input_audio)
+    all_visualizations = []
+
+    with GradCAM(model=wrapped_model, target_layers=target_layers) as cam:
+        for temporal_idx in range(temporal_dimension_size):
+            grayscale_cam = cam(input_tensor=input_video, targets=targets)
+            grayscale_cam = grayscale_cam[0, temporal_idx]
+
+            visualization = show_cam_on_image(rgb_img_collection[temporal_idx], grayscale_cam, use_rgb=True)
+            all_visualizations.append(visualization)
+
+    dump_cam_to_disk(all_visualizations, dump_file_path)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Video CAV-MAE')
 
@@ -177,7 +252,7 @@ if __name__ == '__main__':
     mavos_dd = datasets.Dataset.load_from_disk(input_path)
     test_loader = DataLoader(
         MavosDD(
-            mavos_dd.filter(lambda sample: sample['split']=='test'),
+            mavos_dd.filter(lambda sample: sample['split']=='test' and sample['label'] == 'real'),
             input_path,
             audio_conf,
             stage=2),
@@ -197,7 +272,14 @@ if __name__ == '__main__':
 
     # Select frame(s) to generate CAM for
     audio_input, video_input, labels, video_path = next(iter(test_loader))
-    output_file_name_prefix = 'fake' if labels[0][0] == 0 else 'real'
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    audio_input = audio_input.to(device)
+    video_input = video_input.to(device)
+
+    # 0=real ; 1=fake
+    # real: tensor(0, 1)
+    # fake: tensor(1, 0)
+    output_file_name_prefix = 'real' if labels[0][0] == 0 else 'fake'
 
     # print(audio_input.shape)
     # print('====== AUDIO ENCODER ======')
@@ -207,17 +289,27 @@ if __name__ == '__main__':
     # print('\n====== MLP ======')
     # print(cavmae_ft.module.mlp_head)
     
-    # visual_gradcam_show(
-    #     model=cavmae_ft.module.visual_encoder,
-    #     input_tensor=video_input,
-    #     target_layers=[cavmae_ft.module.visual_encoder.patch_embedding.projection],
-    #     targets=[FeatureSumTarget()],
-    #     dump_file_path=f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{output_file_name_prefix}_gradcam_video.mp4'
-    # )
-    audio_gradcam_show(
-        model=cavmae_ft.module.audio_encoder,
-        input_tensor=audio_input,
-        target_layers=[cavmae_ft.module.audio_encoder.patch_embed.proj],
+    visual_gradcam_show(
+        model=cavmae_ft.module.visual_encoder,
+        input_tensor=video_input,
+        target_layers=[cavmae_ft.module.visual_encoder.patch_embedding.projection],
         targets=[FeatureSumTarget()],
-        dump_file_path=f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{output_file_name_prefix}_gradcam_audio.jpg'
+        dump_file_path=f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/GRADSUM-{output_file_name_prefix}_gradcam_video.mp4'
+    )
+
+    # audio_gradcam_show(
+    #     model=cavmae_ft.module.audio_encoder,
+    #     input_tensor=audio_input,
+    #     target_layers=[cavmae_ft.module.audio_encoder.patch_embed.proj],
+    #     targets=[FeatureSumTarget()],
+    #     dump_file_path=f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{output_file_name_prefix}_gradcam_audio.jpg'
+    # )
+
+    gradcam_show(
+        model=cavmae_ft.module,
+        input_video=video_input,
+        input_audio=audio_input,
+        target_layers=[cavmae_ft.module.visual_encoder.patch_embedding.projection],
+        targets=[ClassifierOutputTarget(0)], # 0 -> fake class activation ; 1 -> real class activation
+        dump_file_path=f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/1-CLASSIFIER-{output_file_name_prefix}_gradcam_video.mp4'
     )
