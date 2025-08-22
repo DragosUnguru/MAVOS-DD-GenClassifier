@@ -1,3 +1,4 @@
+import os
 import argparse
 import datasets
 import cv2
@@ -15,7 +16,6 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 
 from custom_cam import MyGradCAM
 
-import matplotlib.cm as cm
 
 # Custom target we want to generate the CAM for.
 # Simple sum of activations as the video module has no classification layer
@@ -159,6 +159,7 @@ def gradcam_show(
     input_audio,
     target_layers,
     targets,
+    reshape_transform=None,
     dump_file_path='/mnt/d/projects/MAVOS-DD-GenClassifer/exp/gradcam_video.mp4',
     norm_mean=[0.4850, 0.4560, 0.4060],
     norm_std=[0.2290, 0.2240, 0.2250]
@@ -211,7 +212,7 @@ def gradcam_show(
     wrapped_model = ModelWrapper(model, fixed_audio_tensor=input_audio)
     all_visualizations = []
 
-    with GradCAM(model=wrapped_model, target_layers=target_layers) as cam:
+    with GradCAM(model=wrapped_model, target_layers=target_layers, reshape_transform=reshape_transform) as cam:
         for temporal_idx in range(temporal_dimension_size):
             grayscale_cam = cam(input_tensor=input_video, targets=targets)
             grayscale_cam = grayscale_cam[0, temporal_idx]
@@ -249,14 +250,14 @@ if __name__ == '__main__':
     print('current mae loss {:.3f}, and contrastive loss {:.3f}'.format(args.mae_loss_weight, args.contrast_loss_weight))
 
     # Load dataset for which to generate CAMs for
-    mavos_dd = datasets.Dataset.load_from_disk(input_path)
+    mavos_dd = datasets.Dataset.load_from_disk(input_path).filter(lambda sample: sample['split']=='test')
     test_loader = DataLoader(
         MavosDD(
-            mavos_dd.filter(lambda sample: sample['split']=='test' and sample['label'] == 'real'),
+            mavos_dd,
             input_path,
             audio_conf,
             stage=2),
-        batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True
+        batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False
     )
 
     # Load pre-trained AVFF model & weights
@@ -270,32 +271,7 @@ if __name__ == '__main__':
     print('Missing: ', miss)
     print('Unexpected: ', unexpected)
 
-    # Select frame(s) to generate CAM for
-    audio_input, video_input, labels, video_path = next(iter(test_loader))
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    audio_input = audio_input.to(device)
-    video_input = video_input.to(device)
-
-    # 0=real ; 1=fake
-    # real: tensor(0, 1)
-    # fake: tensor(1, 0)
-    output_file_name_prefix = 'real' if labels[0][0] == 0 else 'fake'
-
-    # print(audio_input.shape)
-    # print('====== AUDIO ENCODER ======')
-    # print(cavmae_ft.module.audio_encoder)
-    # print('\n====== VIDEO ENCODER ======')
-    # print(cavmae_ft.module.visual_encoder)
-    # print('\n====== MLP ======')
-    # print(cavmae_ft.module.mlp_head)
-    
-    visual_gradcam_show(
-        model=cavmae_ft.module.visual_encoder,
-        input_tensor=video_input,
-        target_layers=[cavmae_ft.module.visual_encoder.patch_embedding.projection],
-        targets=[FeatureSumTarget()],
-        dump_file_path=f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/GRADSUM-{output_file_name_prefix}_gradcam_video.mp4'
-    )
 
     # audio_gradcam_show(
     #     model=cavmae_ft.module.audio_encoder,
@@ -305,11 +281,96 @@ if __name__ == '__main__':
     #     dump_file_path=f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{output_file_name_prefix}_gradcam_audio.jpg'
     # )
 
-    gradcam_show(
-        model=cavmae_ft.module,
-        input_video=video_input,
-        input_audio=audio_input,
-        target_layers=[cavmae_ft.module.visual_encoder.patch_embedding.projection],
-        targets=[ClassifierOutputTarget(0)], # 0 -> fake class activation ; 1 -> real class activation
-        dump_file_path=f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/1-CLASSIFIER-{output_file_name_prefix}_gradcam_video.mp4'
-    )
+    # visual_gradcam_show(
+    #     model=cavmae_ft.module.visual_encoder,
+    #     input_tensor=video_input,
+    #     target_layers=[cavmae_ft.module.visual_encoder.patch_embedding.projection],
+    #     targets=[FeatureSumTarget()],
+    #     dump_file_path=f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/GRADSUM-{output_file_name_prefix}_gradcam_video.mp4'
+    # )
+
+    generative_methods = ['echomimic', 'freevc', 'hififace', 'inswapper', 'knnvc', 'liveportrait', 'memo', 'real', 'roop', 'sonic']
+    languages = ['arabic', 'english', 'german', 'hindi', 'mandarin', 'romanian', 'russian', 'spanish']
+
+    num_samples = 3
+    generated_so_far = {}
+    for generative_method in generative_methods:
+        for language in languages:
+            generated_so_far[f'{generative_method}_{language}'] = 0
+
+    # real: tensor(0, 1)
+    # fake: tensor(1, 0)
+    # 0 -> fake class activation
+    # 1 -> real class activation
+    fake_class_target = ClassifierOutputTarget(0)
+    real_class_target = ClassifierOutputTarget(1)
+
+    def reshape_transform_temporal(tensor, num_frames=16, height=224, width=224, patch_size=(2,16,16)):
+        """
+        Reshape transformer output (B, N, D) into (B, D, Nt, Nh, Nw),
+        where Nt = num_frames / patch_size[0], Nh = H / patch_size[1], Nw = W / patch_size[2].
+        """
+        B, N, D = tensor.shape
+        
+        Nt = num_frames // patch_size[0]
+        Nh = height // patch_size[1]
+        Nw = width // patch_size[2]
+
+        assert N == Nt * Nh * Nw, f"Shape mismatch: got N={N}, expected {Nt*Nh*Nw}"
+        
+        tensor = tensor.view(B, Nt, Nh, Nw, D)   # (B, Nt, Nh, Nw, D)
+        tensor = tensor.permute(0, 4, 1, 2, 3)   # (B, D, Nt, Nh, Nw)
+        return tensor
+
+    
+    for (audio_input, video_input, labels, video_path) in test_loader:
+        unbatched_label = labels[0]
+        unbatched_video_path = video_path[0]
+
+        (language, generative_method, video_name) = unbatched_video_path.split(os.path.sep)
+
+        if generative_method == 'real':
+            label = 'real'
+            targets = [real_class_target]
+
+            assert unbatched_label[0] == 0
+        else:
+            label = 'fake'
+            targets = [fake_class_target]
+
+            assert unbatched_label[0] == 1
+
+        if (generated_so_far[f'{generative_method}_{language}'] == num_samples):
+            continue
+
+        dump_file_path = f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{language}/{generative_method}/GradCAM-Att-{video_name}'
+        print(f'Generating {dump_file_path}...')
+
+        audio_input = audio_input.to(device)
+        video_input = video_input.to(device)
+
+        # gradcam_show(
+        #     model=cavmae_ft.module,
+        #     input_video=video_input,
+        #     input_audio=audio_input,
+        #     target_layers=[cavmae_ft.module.visual_encoder.patch_embedding.projection],
+        #     targets=targets,
+        #     dump_file_path=dump_file_path
+        # )
+        gradcam_show(
+            model=cavmae_ft.module,
+            input_video=video_input,
+            input_audio=audio_input,
+            target_layers=[
+                cavmae_ft.module.visual_encoder.blocks[11].attn.proj,             # last attention projection
+                cavmae_ft.module.visual_encoder.blocks[11].mlp.layers[1].linear,  # last MLP linear
+                cavmae_ft.module.visual_encoder.norm                              # final LN
+            ],
+            targets=targets,
+            reshape_transform=reshape_transform_temporal,
+            dump_file_path=dump_file_path
+        )
+
+        generated_so_far[f'{generative_method}_{language}'] += 1
+        if sum(generated_so_far.values()) == num_samples * len(generative_methods) * len(languages):
+            break
