@@ -316,7 +316,7 @@ if __name__ == '__main__':
         Nh = height // patch_size[1]
         Nw = width // patch_size[2]
 
-        assert N == Nt * Nh * Nw, f"Shape mismatch: got N={N}, expected {Nt*Nh*Nw}"
+        assert N == Nt * Nh * Nw, f"Shape mismatch: got N={N}, expected {Nt * Nh * Nw}"
         
         tensor = tensor.view(B, Nt, Nh, Nw, D)   # (B, Nt, Nh, Nw, D)
         tensor = tensor.permute(0, 4, 1, 2, 3)   # (B, D, Nt, Nh, Nw)

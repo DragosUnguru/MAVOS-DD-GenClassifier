@@ -3,13 +3,11 @@ import os
 import torch
 import datasets
 from torch.utils.data import DataLoader
-from dataloader import VideoAudioDataset
 from models.video_cav_mae import VideoCAVMAEFT
 from traintest_ft import train
 import warnings
 
-from mavosdd_dataset import MavosDD
-from exddv_dataset import ExDDV
+from mavosdd_dataset_multiclass import MavosDD
 
 
 parser = argparse.ArgumentParser(description='Video CAV-MAE')
@@ -58,82 +56,64 @@ val_audio_conf = {'num_mel_bins': 128, 'target_length': args.target_length, 'fre
 print('current mae loss {:.3f}, and contrastive loss {:.3f}'.format(args.mae_loss_weight, args.contrast_loss_weight))
 
 # Construct dataloader
-flag_mavos = True
-if flag_mavos:
-    input_path = "/mnt/d/projects/datasets/MAVOS-DD"
-    class_name_to_label_mapping = {
-        'real': 0,
-        'echomimic': 1,
-        'hififace': 2,
-        'inswapper': 3,
-        'liveportrait': 4,
-        'memo': 5,
-        'roop': 6,
-        'sonic': 7,
-    }
+input_path = "/mnt/d/projects/datasets/MAVOS-DD"
+class_name_to_label_mapping = {
+    'real': 0,
+    'echomimic': 1,
+    'hififace': 2,
+    'inswapper': 3,
+    'liveportrait': 4,
+    'memo': 5,
+    'roop': 6,
+    'sonic': 7,
+    'audio_real': 8,
+    'audio_fake': 9
+}
 
-    mavos_dd = datasets.Dataset.load_from_disk(input_path)
+mavos_dd = datasets.Dataset.load_from_disk(input_path)
 
-    train_loader = DataLoader(
-        MavosDD(
-            mavos_dd.filter(lambda sample: sample['split']=="train"),
-            input_path,
-            audio_conf,
-            stage=2,
-            class_name_to_idx=class_name_to_label_mapping),
-        batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True
-    )
-    val_loader = DataLoader(
-        MavosDD(
-            mavos_dd.filter(lambda sample: sample['split']=="validation"),
-            input_path,
-            audio_conf,
-            stage=2,
-            class_name_to_idx=class_name_to_label_mapping),
-        batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=True
-    )
-else:
-    input_path = None
-    csv_path = "/home/eivor/biodeep/xAI_deepfake/dataset5.csv"
-
-    train_loader = DataLoader(
-        ExDDV(csv_path, input_path, audio_conf, stage=2),
-        batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True
-    )
-    val_loader = DataLoader(
-        ExDDV(csv_path, input_path, audio_conf, stage=2),
-        batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=True
-    )
-
+train_loader = DataLoader(
+    MavosDD(
+        mavos_dd.filter(lambda sample: sample['split']=="train"),
+        input_path,
+        audio_conf,
+        stage=2,
+        class_name_to_idx=class_name_to_label_mapping),
+    batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True
+)
+val_loader = DataLoader(
+    MavosDD(
+        mavos_dd.filter(lambda sample: sample['split']=="validation"),
+        input_path,
+        audio_conf,
+        stage=2,
+        class_name_to_idx=class_name_to_label_mapping),
+    batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=True
+)
 
 print(f"Using Train: {len(train_loader)}, Eval: {len(val_loader)}")
 
-# Construct model
-cavmae_ft = VideoCAVMAEFT(n_classes=8)
+# Load pre-trained AVFF model & weights
+cavmae_ft = VideoCAVMAEFT(n_classes=len(class_name_to_label_mapping))
+if not isinstance(cavmae_ft, torch.nn.DataParallel):
+    cavmae_ft = torch.nn.DataParallel(cavmae_ft)
 
-# init model
 if args.pretrain_path is not None:
-    mdl_weight = torch.load(args.pretrain_path, map_location='cpu')
-    # if not isinstance(cavmae_ft, torch.nn.DataParallel):
-    #     cavmae_ft = torch.nn.DataParallel(cavmae_ft)
-    if args.pretrain_path.endswith("avff_mavos.pth"):
-        # Adapt model weights saved with DataParallel
-        new_state_dict = {
-            (k[7:] if k.startswith("module.") else k): v for k, v in mdl_weight.items()
-        }
-        mdl_weight = new_state_dict
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    mdl_weight = torch.load(args.pretrain_path, map_location=device)
 
-        # Ignore weights of last FC layer
-        del mdl_weight['mlp_head.fc3.weight']
-        del mdl_weight['mlp_head.fc3.bias']
+    # Ignore weights of last FC layer
+    del mdl_weight['module.mlp_head.fc3.weight']
+    del mdl_weight['module.mlp_head.fc3.bias']
 
     miss, unexpected = cavmae_ft.load_state_dict(mdl_weight, strict=False)
-    print("Missing: ", miss)
-    print("Unexpected: ", unexpected)
+
+    print('Missing: ', miss)
+    print('Unexpected: ', unexpected)
     print('now load pretrain model from {:s}, missing keys: {:d}, unexpected keys: {:d}'.format(args.pretrain_path, len(miss), len(unexpected)))
 else:
     warnings.warn("Note you are finetuning a model without any finetuning.")
-    
+
 print("\n Creating experiment directory: %s"%args.save_dir)
 if not os.path.exists(args.save_dir):
     os.makedirs(args.save_dir)

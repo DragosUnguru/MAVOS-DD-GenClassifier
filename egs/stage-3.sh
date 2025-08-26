@@ -16,7 +16,7 @@ mae_loss_weight=1.0
 norm_pix_loss=True
 
 # you can use any checkpoints with a decoder, but by default, we use vision-MAE checkpoint
-pretrain_path=/mnt/d/projects/MAVOS-DD-GenClassifer/UniBuc-AVFF/checkpoints/avff_mavos.pth
+pretrain_path=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/stage-3.pth
 
 lr=1e-5
 head_lr=50
@@ -35,11 +35,11 @@ lr_adapt=False
 
 n_print_steps=100
 
-tr_data=/mnt/d/projects/MAVOS-DD-GenClassifer/UniBuc-AVFF/data/mavos-dd_train.csv
-te_data=/mnt/d/projects/MAVOS-DD-GenClassifer/UniBuc-AVFF/data/mavos-dd_validation.sv
+tr_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_train.csv
+te_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_validation.sv
 
 # exp_dir=./exp/self-pretrain
-save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/UniBuc-AVFF/exp/stage-3
+save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3
 mkdir -p $save_dir
 mkdir -p ${save_dir}/models
 

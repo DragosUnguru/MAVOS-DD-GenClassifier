@@ -58,8 +58,11 @@ class MavosDD(Dataset):
         self.num_classes = len(class_name_to_idx)
 
         self.per_class_name_dataset_split = {
-            class_name: self.dataset.filter(lambda sample: sample["generative_method"] == class_name)
-            for class_name in self.class_name_to_idx
+            audio_class_name: {
+                class_name: self.dataset.filter(lambda sample: sample["generative_method"] == class_name and sample["audio_fake"] == audio_class_name)
+                for class_name in self.class_name_to_idx
+            }
+            for audio_class_name in [True, False]
         }
 
         print('Dataset has {:d} samples'.format(len(self.dataset)))
@@ -219,57 +222,76 @@ class MavosDD(Dataset):
 
         # Extract features of the initial sample
         class_name = sample["generative_method"]
-        label = self.class_name_to_idx[class_name]
+        is_fake_audio = sample["audio_fake"]
+
+        video_label = self.class_name_to_idx[class_name]
         video_name = os.path.join(self.input_path, sample["video_path"])
 
         # Find another random sample from the same class as our sample
-        same_class_dataset = self.per_class_name_dataset_split[class_name]
+        same_class_dataset = self.per_class_name_dataset_split[is_fake_audio][class_name]
         index_1 = random.choice([i for i in range(len(same_class_dataset))])
         sample_1 = same_class_dataset[index_1]
         video_name_1 = os.path.join(self.input_path, sample_1["video_path"])
 
         # Run validation
         label_1 = self.class_name_to_idx[sample_1["generative_method"]]
-        assert label == label_1, "When augmenting data, the two samples should come from the same class"
+
+        assert video_label == label_1, "When augmenting data, the two samples should come from the same class for the video"
+        assert is_fake_audio == sample_1["audio_fake"], "When augmenting data, the two samples should come from the same class for the audio"
 
         # Concat the two samples
         fbank = self._concat_wav2fbank(video_name, video_name_1)
         frames = self._concat_get_frames(video_name, video_name_1)
 
+        # ?????
         if self.stage == 1:
-            label = self.class_name_to_idx["real"]
+            video_label = self.class_name_to_idx["real"]
 
-        return fbank, frames, label
+        audio_label = 1.0 if is_fake_audio else 0.0
+
+        return fbank, frames, video_label, audio_label
 
     def _augment_replace(self, index):
         sample = self.dataset[index]
 
         # Extract features of the initial sample
         class_name = sample["generative_method"]
-        label = self.class_name_to_idx[class_name]
+        is_fake_video = sample["video_fake"]
+        is_fake_audio = sample["audio_fake"]
+
+        video_label = self.class_name_to_idx[class_name]
         video_name = os.path.join(self.input_path, sample["video_path"])
 
-        if int(label) == self.class_name_to_idx["real"]:
-            # Augmenting a 'real' video would turn it in a 'fake' one
-            # Avoid augmenting real videos 
+        if (not is_fake_video) and (not is_fake_audio):
+            # Augmenting a 'real' video would turn it in a 'fake' one?
+            # Avoid augmenting real videos with real audios
+            assert class_name == "real"
+
             frames = self._get_frames(video_name)
             fbank = self._wav2fbank(video_name)
-            return fbank, frames, label
+            audio_label = 0.0
+
+            return fbank, frames, video_label, audio_label
 
         # Find another random sample from the same class as our sample
-        same_class_dataset = self.per_class_name_dataset_split[class_name]
+        same_class_dataset = self.per_class_name_dataset_split[is_fake_audio][class_name]
         index_1 = random.choice([i for i in range(len(same_class_dataset))])
+
         sample_1 = same_class_dataset[index_1]
         video_name_1 = os.path.join(self.input_path, sample_1["video_path"])
 
         # Run validation
-        label_1 = self.class_name_to_idx[sample_1["generative_method"]]
-        assert label == label_1, "When augmenting data, the two samples should come from the same class"
+        video_label_1 = self.class_name_to_idx[sample_1["generative_method"]]
+
+        assert video_label == video_label_1, "When augmenting data, the two samples should come from the same class for the video"
+        assert is_fake_audio == sample_1["audio_fake"], "When augmenting data, the two samples should come from the same class for the audio"
 
         # Replace audio with other
         frames = self._get_frames(video_name)
         fbank = self._wav2fbank(video_name_1)
-        return fbank, frames, label
+        audio_label = 1.0 if sample_1["audio_fake"] else 0.0
+
+        return fbank, frames, video_label, audio_label
 
     def __getitem__(self, index):
         show_time = False
@@ -281,7 +303,8 @@ class MavosDD(Dataset):
         
         video_name = os.path.join(self.input_path,sample["video_path"])
         # label = 0 if sample["label"] == "real" else 1
-        label = self.class_name_to_idx[sample["generative_method"]]
+        video_label = self.class_name_to_idx[sample["generative_method"]]
+        audio_label = 1.0 if sample["audio_fake"] else 0.0
 
         # Do not perform data augment under eval mode
         if self.mode == 'eval':
@@ -302,9 +325,9 @@ class MavosDD(Dataset):
             elif self.stage == 2:
                 augment = random.choices(self.augment_2, weights=self.augment_2_weight)[0]
             if augment == 'concat':
-                fbank, frames, label = self._augment_concat(index)
+                fbank, frames, video_label, audio_label = self._augment_concat(index)
             elif augment == 'replace':
-                fbank, frames, label = self._augment_replace(index)
+                fbank, frames, video_label, audio_label = self._augment_replace(index)
             else:
                 try:
                     fbank = self._wav2fbank(video_name)
@@ -368,7 +391,21 @@ class MavosDD(Dataset):
         frames = frames.permute(1, 0, 2, 3)
         
         # label = torch.tensor([int(label), 1-int(label)]).float()
-        label = torch.nn.functional.one_hot(torch.tensor(label, dtype=torch.long), self.num_classes).float()
+        # label = torch.nn.functional.one_hot(torch.tensor(label, dtype=torch.long), self.num_classes).float()
+
+        # TODO: Two separate layers w/ two separate losses??
+        # video_label = torch.tensor(video_label, dtype=torch.long)  # for CrossEntropyLoss
+        # audio_label = torch.tensor(audio_label, dtype=torch.float) # for BCEWithLogitsLoss
+
+        label = torch.zeros(self.num_classes, dtype=torch.float)
+
+        # video label (0..7)
+        label[video_label] = 1.0
+
+        if audio_label == 1.0: # Fake audio
+            self.class_name_to_idx["audio_fake"] = 1.0
+        else:
+            self.class_name_to_idx["audio_real"] = 1.0
 
         return fbank, frames, label, sample["video_path"]
 
