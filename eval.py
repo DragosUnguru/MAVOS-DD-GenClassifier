@@ -22,7 +22,7 @@ DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
 CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3/audio+video_classes_but_just_video_labels"
 CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.10.pth"
 INFERENCE_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS.json"
-PLOT_OUT_PATH = f"{CHECKPOINT_PATH}/eval/audio_model.10.{SPLIT_TO_EVALUATE}.png"
+PLOT_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.{SPLIT_TO_EVALUATE}.png"
 
 class_name_to_label_mapping = {
     'real': 0,
@@ -121,7 +121,7 @@ def plot_multiclass_confusion_matrix(y_pred, y_true, class_name_to_label_mapping
         If True, display percentages. If False, display raw counts.
     """
     y_true = np.array(y_true)
-    y_pred = torch.softmax(torch.Tensor(y_pred), dim=1).cpy().numpy()
+    y_pred = torch.softmax(torch.Tensor(y_pred), dim=1).cpu().numpy()
 
     # Convert one-hot to class indices
     y_true_idx = np.argmax(y_true, axis=1)
@@ -188,7 +188,7 @@ if __name__ == "__main__":
     stats = calculate_stats(y_pred, y_true)
 
     print(f"======= {SPLIT_TO_EVALUATE}: =======")
-    print(f"auc={list(map(lambda entry: entry['auc'], stats['per_class']))}")
+    print(f"AUC={list(map(lambda entry: entry['AUC'], stats['per_class']))}")
     print(f"precisions={list(map(lambda entry: entry['precisions'], stats['per_class']))}")
     print(f"recalls={list(map(lambda entry: entry['recalls'], stats['per_class']))}")
     print(stats)
@@ -196,9 +196,9 @@ if __name__ == "__main__":
     multilabel = np.any(np.array(y_true).sum(axis=1) > 1)
 
     if multilabel:
-        plot_multilabel_confusion_matrix(y_pred, y_true, class_name_to_label_mapping)
+        plot_multilabel_confusion_matrix(y_pred, y_true, class_name_to_label_mapping, normalize=False)
     else:
-        plot_multiclass_confusion_matrix(y_pred, y_true, class_name_to_label_mapping)
+        plot_multiclass_confusion_matrix(y_pred, y_true, class_name_to_label_mapping, normalize=False)
 
 """
 ======= audio+video_classes_but_just_video_labels =======

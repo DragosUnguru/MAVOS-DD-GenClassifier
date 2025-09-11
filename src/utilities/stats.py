@@ -50,7 +50,7 @@ def calculate_stats(output, target):
                 save_every_steps = 1000
                 per_class_stats.append({
                     'AP': avg_precision,
-                    'auc': auc,
+                    'AUC': auc,
                     'precisions': precisions[::save_every_steps],
                     'recalls': recalls[::save_every_steps],
                     'fpr': fpr[::save_every_steps],
@@ -59,7 +59,7 @@ def calculate_stats(output, target):
             except Exception:
                 per_class_stats.append({
                     'AP': avg_precision,
-                    'auc': -1,
+                    'AUC': -1,
                     'precisions': -1,
                     'recalls': -1,
                     'fpr': -1,
