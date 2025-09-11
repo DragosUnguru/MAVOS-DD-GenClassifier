@@ -102,6 +102,8 @@ if args.pretrain_path is not None:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     mdl_weight = torch.load(args.pretrain_path, map_location=device)
 
+    print(f'Running on {device}')
+
     # Ignore weights of last FC layer
     del mdl_weight['module.mlp_head.fc3.weight']
     del mdl_weight['module.mlp_head.fc3.bias']

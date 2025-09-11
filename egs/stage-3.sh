@@ -30,7 +30,7 @@ dataset_mean=-5.081
 dataset_std=4.4849
 target_length=1024
 noise=True
-batch_size=42
+batch_size=32
 lr_adapt=False
 
 n_print_steps=100
@@ -43,8 +43,8 @@ save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3
 mkdir -p $save_dir
 mkdir -p ${save_dir}/models
 
-CUDA_CACHE_DISABLE=1 CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 python -W ignore ../src/run_ft.py \
---data-train ${tr_data} --data-val ${te_data} --save-dir $save_dir --n_classes 2 \
+CUDA_CACHE_DISABLE=1 python -W ignore ../src/run_ft.py \
+--data-train ${tr_data} --data-val ${te_data} --save-dir $save_dir --n_classes 10 \
 --lr $lr --n-epochs ${epoch} --batch-size $batch_size \
 --lrscheduler_start ${lrscheduler_start} --lrscheduler_decay ${lrscheduler_decay} --lrscheduler_step ${lrscheduler_step} \
 --dataset_mean ${dataset_mean} --dataset_std ${dataset_std} --target_length ${target_length} --noise ${noise} \
@@ -54,4 +54,4 @@ CUDA_CACHE_DISABLE=1 CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 python -W ignore ../src/
 --loss BCE --metrics mAP --warmup True \
 --wa_start ${wa_start} --wa_end ${wa_end} --lr_adapt ${lr_adapt} \
 --head_lr ${head_lr} \
---pretrain_path ${pretrain_path} --num_workers 32\
+--pretrain_path ${pretrain_path} --num_workers 2\

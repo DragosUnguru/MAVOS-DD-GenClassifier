@@ -403,9 +403,9 @@ class MavosDD(Dataset):
         label[video_label] = 1.0
 
         if audio_label == 1.0: # Fake audio
-            self.class_name_to_idx["audio_fake"] = 1.0
+            label[self.class_name_to_idx["audio_fake"]] = 1.0
         else:
-            self.class_name_to_idx["audio_real"] = 1.0
+            label[self.class_name_to_idx["audio_real"]] = 1.0
 
         return fbank, frames, label, sample["video_path"]
 
