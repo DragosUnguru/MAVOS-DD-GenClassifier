@@ -20,21 +20,23 @@ SPLIT_TO_EVALUATE = "closed-set"
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
 CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3/audio+video_classes_but_just_video_labels"
-CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/best_audio_model.pth"
-INFERENCE_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/best_audio_model.PREDICTIONS.json"
-PLOT_OUT_PATH = f"{CHECKPOINT_PATH}/eval/best_audio_model.{SPLIT_TO_EVALUATE}.png"
+CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.10.pth"
+INFERENCE_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS.json"
+PLOT_OUT_PATH = f"{CHECKPOINT_PATH}/eval/audio_model.10.{SPLIT_TO_EVALUATE}.png"
 
 class_name_to_label_mapping = {
     'real': 0,
     'echomimic': 1,
-    'hififace': 2,
-    'inswapper': 3,
-    'liveportrait': 4,
-    'memo': 5,
-    'roop': 6,
-    'sonic': 7,
-    'audio_real': 8,
-    'audio_fake': 9
+    'freevc': 2,
+    'hififace': 3,
+    'inswapper': 4,
+    'knnvc': 5,
+    'liveportrait': 6,
+    'memo': 7,
+    'roop': 8,
+    'sonic': 9,
+    'audio_real': 10,
+    'audio_fake': 11
 }
 
 dataset_mean=-5.081
@@ -60,8 +62,7 @@ def plot_multilabel_confusion_matrix(y_pred, y_true, class_name_to_label_mapping
         If True, display percentages. If False, display raw counts.
     """
     y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
-    # y_pred = torch.round(torch.sigmoid(torch.Tensor(y_pred))).cpu().numpy()
+    y_pred = torch.round(torch.sigmoid(torch.Tensor(y_pred))).cpu().numpy()
 
     class_names = list(class_name_to_label_mapping.keys())
     n_classes = len(class_names)
@@ -120,7 +121,7 @@ def plot_multiclass_confusion_matrix(y_pred, y_true, class_name_to_label_mapping
         If True, display percentages. If False, display raw counts.
     """
     y_true = np.array(y_true)
-    y_pred = torch.round(torch.sigmoid(torch.Tensor(y_pred))).cpu().numpy()
+    y_pred = torch.softmax(torch.Tensor(y_pred), dim=1).cpy().numpy()
 
     # Convert one-hot to class indices
     y_true_idx = np.argmax(y_true, axis=1)
@@ -152,50 +153,6 @@ def plot_multiclass_confusion_matrix(y_pred, y_true, class_name_to_label_mapping
     plt.tight_layout()
     plt.savefig(PLOT_OUT_PATH)
     plt.show()
-
-
-def calculate_stats_singlelabel(output, target):
-    """
-    Calculate metrics for single-label multi-class classification.
-    
-    Args:
-        output: 2d array, (samples_num, classes_num), one-hot predictions (0.0 or 1.0).
-        target: 2d array, (samples_num, classes_num), one-hot ground truth.
-    
-    Returns:
-        stats: dict with overall + per-class metrics
-    """
-    output = np.array(output)
-    target = np.array(target)
-    n_classes = target.shape[-1]
-
-    # Convert from one-hot to class indices
-    preds = np.argmax(output, axis=1)
-    true = np.argmax(target, axis=1)
-
-    # --- Overall metrics ---
-    acc = metrics.accuracy_score(true, preds)
-    f1_macro = metrics.f1_score(true, preds, average="macro")
-    f1_micro = metrics.f1_score(true, preds, average="micro")
-    cm = metrics.confusion_matrix(true, preds, labels=range(n_classes))
-
-    # --- Per-class metrics ---
-    precision = metrics.precision_score(true, preds, average=None, labels=range(n_classes), zero_division=0)
-    recall = metrics.recall_score(true, preds, average=None, labels=range(n_classes), zero_division=0)
-    f1_per_class = metrics.f1_score(true, preds, average=None, labels=range(n_classes), zero_division=0)
-
-    # Store results
-    stats = {
-        "accuracy": acc,
-        "f1_macro": f1_macro,
-        "f1_micro": f1_micro,
-        "precision_per_class": precision.tolist(),
-        "recall_per_class": recall.tolist(),
-        "f1_per_class": f1_per_class.tolist(),
-        "confusion_matrix": cm.tolist()
-    }
-
-    return stats
 
 
 if __name__ == "__main__":
@@ -231,6 +188,9 @@ if __name__ == "__main__":
     stats = calculate_stats(y_pred, y_true)
 
     print(f"======= {SPLIT_TO_EVALUATE}: =======")
+    print(f"auc={list(map(lambda entry: entry['auc'], stats['per_class']))}")
+    print(f"precisions={list(map(lambda entry: entry['precisions'], stats['per_class']))}")
+    print(f"recalls={list(map(lambda entry: entry['recalls'], stats['per_class']))}")
     print(stats)
 
     multilabel = np.any(np.array(y_true).sum(axis=1) > 1)
@@ -241,7 +201,19 @@ if __name__ == "__main__":
         plot_multiclass_confusion_matrix(y_pred, y_true, class_name_to_label_mapping)
 
 """
-======= closed-set: =======
+======= audio+video_classes_but_just_video_labels =======
+    classes_to_idx = {
+        'real': 0,
+        'echomimic': 1,
+        'hififace': 2,
+        'inswapper': 3,
+        'liveportrait': 4,
+        'memo': 5,
+        'roop': 6,
+        'sonic': 7,
+    }
+
+--- best_audio_model.pth # closed-set ---
 {
     "accuracy": 0.9446448917584505,
     "f1_macro": 0.9271457881657005,
@@ -251,5 +223,22 @@ if __name__ == "__main__":
     "f1_per_class": [ 0.9595479415194188, 0.9235836627140975, 0.0, 0.929676221901423, 0.8692515779981965, 0.9536695366953668, 0.0, 0.0 ]
 }
 
+--- audio_model.10.pth # closed-set ---
+{
+    "mode": "multiclass",
+    "accuracy": 0.9454044815799468,
+    "f1_macro": 0.9294779324126082,
+    "f1_micro": 0.9454044815799468,
+    "AP_macro": 0.6102186724039896,
+    "AP_micro": 0.9855098518064085,
+    "AUC_macro": 0.9930264070226095,
+    "AUC_micro": 0.997000946607545,
+    "precision_per_class: [ 0.9911027950738813, 0.9774638756965911, -0.0, 0.9807828106030021, 0.9410743670411317, 0.9913255308173108, -0.0, -0.0 ]
+    "auc_per_class: [ 0.9916786581701739, 0.9963693344677388, -1, 0.9919814651854895, 0.9864397836609017, 0.998662793628743, -1, -1 ]"
+}
 
+Got precision == 0 for: hififace, roop, sonic
+    hififace -> real/inswapper
+    roop -> real/inswapper
+    sonic -> memo
 """

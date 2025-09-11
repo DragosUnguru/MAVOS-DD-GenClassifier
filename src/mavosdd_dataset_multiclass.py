@@ -421,12 +421,16 @@ if __name__ == "__main__":
     class_name_to_label = {
         'real': 0,
         'echomimic': 1,
-        'hififace': 2,
-        'inswapper': 3,
-        'liveportrait': 4,
-        'memo': 5,
-        'roop': 6,
-        'sonic': 7,
+        'freevc': 2,
+        'hififace': 3,
+        'inswapper': 4,
+        'knnvc': 5,
+        'liveportrait': 6,
+        'memo': 7,
+        'roop': 8,
+        'sonic': 9,
+        'audio_real': 10,
+        'audio_fake': 11
     }
 
     input_path = "/mnt/d/projects/datasets/MAVOS-DD"

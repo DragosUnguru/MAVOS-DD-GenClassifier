@@ -147,8 +147,8 @@ def train(model, train_loader, test_loader, args):
         # mAP = np.mean([stat['AP'] for stat in stats])
         # mAUC = np.mean([stat['auc'] for stat in stats])
         # acc = stats[0]['acc'] # this is just a trick, acc of each class entry is the same, which is the accuracy of all classes, not class-wise accuracy
-        mAP = stats['macro_AP']
-        mAUC = stats['macro_AUC']
+        mAP = stats['AP_macro']
+        mAUC = stats['AUC_macro']
         acc = stats['accuracy']
 
         if main_metrics == 'mAP':

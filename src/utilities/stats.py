@@ -78,10 +78,10 @@ def calculate_stats(output, target):
         stats = {
             "mode": "multilabel",
             "accuracy": acc,
-            "macro_AP": macro_ap,
-            "macro_AUC": macro_auc,
-            "micro_AP": micro_ap,
-            "micro_AUC": micro_auc,
+            "AP_macro": macro_ap,
+            "AP_micro": micro_ap,
+            "AUC_macro": macro_auc,
+            "AUC_micro": micro_auc,
             "per_class": per_class_stats
         }
 
@@ -111,7 +111,7 @@ def calculate_stats(output, target):
 
                 per_class_stats.append({
                     'AP': avg_precision,
-                    'auc': auc,
+                    'AUC': auc,
                     'precisions': precisions,
                     'recalls': recalls,
                     'fpr': fpr,
@@ -120,7 +120,7 @@ def calculate_stats(output, target):
             except Exception:
                 per_class_stats.append({
                     'AP': avg_precision,
-                    'auc': -1,
+                    'AUC': -1,
                     'precisions': -1,
                     'recalls': -1,
                     'fpr': -1,
@@ -139,12 +139,12 @@ def calculate_stats(output, target):
         stats = {
             "mode": "multiclass",
             "accuracy": acc,
-            "f1_macro": f1_macro,
-            "f1_micro": f1_micro,
-            "macro_AP": macro_ap,
-            "macro_AUC": macro_auc,
-            "micro_AP": micro_ap,
-            "micro_AUC": micro_auc,
+            "F1_macro": f1_macro,
+            "F1_micro": f1_micro,
+            "AP_macro": macro_ap,
+            "AP_micro": micro_ap,
+            "AUC_macro": macro_auc,
+            "AUC_micro": micro_auc,
             "per_class": per_class_stats
         }
 
