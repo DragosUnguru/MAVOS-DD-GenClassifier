@@ -24,20 +24,20 @@ CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.10.pth"
 INFERENCE_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS.json"
 PLOT_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.{SPLIT_TO_EVALUATE}.png"
 
-class_name_to_label_mapping = {
-    'real': 0,
-    'echomimic': 1,
-    'freevc': 2,
-    'hififace': 3,
-    'inswapper': 4,
-    'knnvc': 5,
-    'liveportrait': 6,
-    'memo': 7,
-    'roop': 8,
-    'sonic': 9,
-    'audio_real': 10,
-    'audio_fake': 11
+video_labels = {
+    "memo": 0,
+    "liveportrait": 1,
+    "inswapper": 2,
+    "echomimic": 3,
 }
+audio_labels = {
+    "knnvc": 4,
+    "freevc": 5,
+    "openvoice": 6,
+    "xtts_v2": 7,
+    "yourtts": 8,
+}
+class_name_to_label_mapping = { **video_labels, **audio_labels }
 
 dataset_mean=-5.081
 dataset_std=4.4849

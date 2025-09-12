@@ -7,7 +7,7 @@ from models.video_cav_mae import VideoCAVMAEFT
 from traintest_ft import train
 import warnings
 
-from mavosdd_dataset_multiclass import MavosDD
+from mavosdd_dataset_multiclass import MavosDD, get_audio_label, try_get_audio_label
 
 
 parser = argparse.ArgumentParser(description='Video CAV-MAE')
@@ -57,39 +57,41 @@ print('current mae loss {:.3f}, and contrastive loss {:.3f}'.format(args.mae_los
 
 # Construct dataloader
 input_path = "/mnt/d/projects/datasets/MAVOS-DD"
-class_name_to_label_mapping = {
-    'real': 0,
-    'echomimic': 1,
-    'freevc': 2,
-    'hififace': 3,
-    'inswapper': 4,
-    'knnvc': 5,
-    'liveportrait': 6,
-    'memo': 7,
-    'roop': 8,
-    'sonic': 9,
-    'audio_real': 10,
-    'audio_fake': 11
+video_labels = {
+    "memo": 0,
+    "liveportrait": 1,
+    "inswapper": 2,
+    "echomimic": 3,
 }
+audio_labels = {
+    "knnvc": 4,
+    "freevc": 5,
+    "openvoice": 6,
+    "xtts_v2": 7,
+    "yourtts": 8,
+}
+class_name_to_label_mapping = { **video_labels, **audio_labels }
 
 mavos_dd = datasets.Dataset.load_from_disk(input_path)
 
 train_loader = DataLoader(
     MavosDD(
-        mavos_dd.filter(lambda sample: sample['split']=="train"),
+        mavos_dd.filter(lambda sample: sample['split']=="train" and (sample['generative_method'] != "real" or sample['audio_generative_method'] != "real")),
         input_path,
         audio_conf,
         stage=2,
-        class_name_to_idx=class_name_to_label_mapping),
+        video_class_name_to_idx=video_labels,
+        audio_class_name_to_idx=audio_labels),
     batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True
 )
 val_loader = DataLoader(
     MavosDD(
-        mavos_dd.filter(lambda sample: sample['split']=="validation"),
+        mavos_dd.filter(lambda sample: sample['split']=="validation" and (sample['generative_method'] != "real" or sample['audio_generative_method'] != "real")),
         input_path,
-        audio_conf,
+        val_audio_conf,
         stage=2,
-        class_name_to_idx=class_name_to_label_mapping),
+        video_class_name_to_idx=video_labels,
+        audio_class_name_to_idx=audio_labels),
     batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=True
 )
 

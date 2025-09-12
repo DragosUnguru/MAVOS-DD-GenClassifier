@@ -12,23 +12,23 @@ from src.mavosdd_dataset_multiclass import MavosDD
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
 CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3/audio+video_classes_but_just_video_labels"
-CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.10.pth"
-DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS.json"
+CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.9.pth"
+DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.9.PREDICTIONS.json"
 
-class_name_to_label_mapping = {
-    'real': 0,
-    'echomimic': 1,
-    'freevc': 2,
-    'hififace': 3,
-    'inswapper': 4,
-    'knnvc': 5,
-    'liveportrait': 6,
-    'memo': 7,
-    'roop': 8,
-    'sonic': 9,
-    'audio_real': 10,
-    'audio_fake': 11
+video_labels = {
+    "memo": 0,
+    "liveportrait": 1,
+    "inswapper": 2,
+    "echomimic": 3,
 }
+audio_labels = {
+    "knnvc": 4,
+    "freevc": 5,
+    "openvoice": 6,
+    "xtts_v2": 7,
+    "yourtts": 8,
+}
+class_name_to_label_mapping = { **video_labels, **audio_labels }
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
