@@ -7,7 +7,7 @@ from models.video_cav_mae import VideoCAVMAEFT
 from traintest_ft import train
 import warnings
 
-from mavosdd_dataset_multiclass import MavosDD, get_audio_label, try_get_audio_label
+from mavosdd_dataset_multiclass import MavosDD
 
 
 parser = argparse.ArgumentParser(description='Video CAV-MAE')

@@ -19,9 +19,7 @@ from PIL import ImageEnhance
 def get_audio_label(audio_generative_method):
     audio_generative_method = audio_generative_method.casefold()
 
-    if audio_generative_method in ["xtts_v2", "yourtts", "real"]:
-        return audio_generative_method
-    elif "openvoice" in audio_generative_method:
+    if "openvoice" in audio_generative_method:
         # TRAIN: {"vits_openvoice_vc"}
         # TEST:  {"vits_openvoice_vc", "fairseq+openvoice", "vits+openvoice"}
         return "openvoice"
@@ -34,7 +32,7 @@ def get_audio_label(audio_generative_method):
         # TEST:  {"melo+freevc", "freevc", "tacotron+freevc", "vits_freevc", "vits+freevc", "bark+freevc", "glowtts+freevc"}
         return "freevc"
     else:
-        raise RuntimeError(f"Invalid audio generative method '{audio_generative_method}' encountered")
+        return audio_generative_method
 
 
 def try_get_audio_label(audio_generative_method):
@@ -89,12 +87,15 @@ class MavosDD(Dataset):
         self.class_name_to_idx = { **video_class_name_to_idx, **audio_class_name_to_idx }
         self.num_classes = len(self.class_name_to_idx)
 
+        possible_video_class_names = set(dataset["generative_method"])
+        possible_audio_class_names = set(map(lambda x: get_audio_label(x), dataset["audio_generative_method"]))
+
         self.per_class_name_dataset_split = {
             audio_class_name: {
                 video_class_name: self.dataset.filter(lambda sample: sample["generative_method"] == video_class_name and try_get_audio_label(sample["audio_generative_method"]) == audio_class_name)
-                for video_class_name in self.video_class_name_to_idx
+                for video_class_name in possible_video_class_names
             }
-            for audio_class_name in audio_class_name_to_idx
+            for audio_class_name in possible_audio_class_names
         }
 
         print('Dataset has {:d} samples'.format(len(self.dataset)))
@@ -419,12 +420,10 @@ class MavosDD(Dataset):
         # audio_label = torch.tensor(audio_label, dtype=torch.float) # for BCEWithLogitsLoss
 
         label = torch.zeros(self.num_classes, dtype=torch.float)
-        if video_class_name != "real":
+        if video_class_name in self.video_class_name_to_idx:
             label[self.video_class_name_to_idx[video_class_name]] = 1.0
-        if audio_class_name != "real":
+        if audio_class_name in self.audio_class_name_to_idx:
             label[self.audio_class_name_to_idx[audio_class_name]] = 1.0
-
-        assert 1 <= torch.sum(label) <= 2, f"The entry should have at least one dimension != 'real'. Got video class '{video_class_name}' and audio class '{audio_class_name}'"
 
         return fbank, frames, label, sample["video_path"]
 
@@ -437,52 +436,68 @@ if __name__ == "__main__":
         'num_mel_bins': 128, 'target_length': 1024, 'freqm': 0, 'timem': 0, 'mode':'train', 
         'mean': -5.081, 'std': 4.4849, 'noise': False, 'label_smooth': 0, 'im_res': 224
     }
-    class_name_to_label = {
-        'real': 0,
-        'echomimic': 1,
-        'freevc': 2,
-        'hififace': 3,
-        'inswapper': 4,
-        'knnvc': 5,
-        'liveportrait': 6,
-        'memo': 7,
-        'roop': 8,
-        'sonic': 9,
-        'audio_real': 10,
-        'audio_fake': 11
+    input_path = "/mnt/d/projects/datasets/MAVOS-DD"
+
+    video_labels = {
+        "memo": 0,
+        "liveportrait": 1,
+        "inswapper": 2,
+        "echomimic": 3,
+    }
+    audio_labels = {
+        "knnvc": 4,
+        "freevc": 5,
+        "openvoice": 6,
+        "xtts_v2": 7,
+        "yourtts": 8,
     }
 
-    input_path = "/mnt/d/projects/datasets/MAVOS-DD"
     mavos_dd = datasets.Dataset.load_from_disk(input_path)
-    dataset = MavosDD(
-        # mavos_dd.filter(lambda sample: sample['split'] == 'validation'),
-        mavos_dd,
-        input_path=input_path,
-        audio_conf=audio_conf,
+    uut = MavosDD(
+        mavos_dd.filter(lambda sample: sample['split']=="test"),
+        input_path,
+        audio_conf,
         stage=2,
-        class_name_to_idx=class_name_to_label)
+        video_class_name_to_idx=video_labels,
+        audio_class_name_to_idx=audio_labels)
 
-    train_dataset = mavos_dd.filter(lambda sample: sample['split'] == 'train')
-    test_dataset = mavos_dd.filter(lambda sample: sample['split'] == 'test')
-    val_dataset = mavos_dd.filter(lambda sample: sample['split'] == 'validation')
+    for i in range(0, len(uut), 300):
+        _, _, label, _ = uut[i]
 
-    def to_dataframe(dataset):
-        return pd.DataFrame({
-            "video_name": [f'{input_path}/{entry["video_path"]}' for entry in dataset],
-            "target": [0] * len(dataset)
-        })
+        assert torch.sum(label) <= 2, f"The label should not have less than 1 or more than 2 classes. Got: {label}"
+        print(f"video={uut.dataset[i]['generative_method']}, audio={uut.dataset[i]['audio_generative_method']} -> {label}")
 
-    train_df = to_dataframe(train_dataset)
-    test_df = to_dataframe(test_dataset)
-    val_df = to_dataframe(val_dataset)
+    # input_path = "/mnt/d/projects/datasets/MAVOS-DD"
+    # mavos_dd = datasets.Dataset.load_from_disk(input_path)
+    # dataset = MavosDD(
+    #     # mavos_dd.filter(lambda sample: sample['split'] == 'validation'),
+    #     mavos_dd,
+    #     input_path=input_path,
+    #     audio_conf=audio_conf,
+    #     stage=2,
+    #     class_name_to_idx=class_name_to_label)
 
-    # Step 3: Save to CSV
-    train_df.to_csv(os.path.join('..', 'data', "mavos-dd_train.csv"), index=False)
-    test_df.to_csv(os.path.join('..', 'data', "mavos-dd_test.csv"), index=False)
-    val_df.to_csv(os.path.join('..', 'data', "mavos-dd_validation.csv"), index=False)
+    # train_dataset = mavos_dd.filter(lambda sample: sample['split'] == 'train')
+    # test_dataset = mavos_dd.filter(lambda sample: sample['split'] == 'test')
+    # val_dataset = mavos_dd.filter(lambda sample: sample['split'] == 'validation')
 
-    print(mavos_dd[0])   # dataset features
-    print(dataset[0][2]) # label
+    # def to_dataframe(dataset):
+    #     return pd.DataFrame({
+    #         "video_name": [f'{input_path}/{entry["video_path"]}' for entry in dataset],
+    #         "target": [0] * len(dataset)
+    #     })
+
+    # train_df = to_dataframe(train_dataset)
+    # test_df = to_dataframe(test_dataset)
+    # val_df = to_dataframe(val_dataset)
+
+    # # Step 3: Save to CSV
+    # train_df.to_csv(os.path.join('..', 'data', "mavos-dd_train.csv"), index=False)
+    # test_df.to_csv(os.path.join('..', 'data', "mavos-dd_test.csv"), index=False)
+    # val_df.to_csv(os.path.join('..', 'data', "mavos-dd_validation.csv"), index=False)
+
+    # print(mavos_dd[0])   # dataset features
+    # print(dataset[0][2]) # label
 
     # mavos_dd = datasets.Dataset.load_from_disk("/mnt/d/projects/datasets/MAVOS-DD")
     
