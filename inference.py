@@ -11,9 +11,9 @@ from src.mavosdd_dataset_multiclass import MavosDD
 
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
-CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3/audio+video_classes_but_just_video_labels"
+CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3"
 CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.9.pth"
-DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.9.PREDICTIONS.json"
+DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.9.PREDICTIONS.closed_set.json"
 
 video_labels = {
     "memo": 0,
@@ -54,7 +54,9 @@ if __name__ == "__main__":
     mavos_dd = datasets.Dataset.load_from_disk(DATASET_INPUT_PATH)
 
     val_loader = torch.utils.data.DataLoader(
-        MavosDD(mavos_dd.filter(lambda sample: sample['split']=="test"), DATASET_INPUT_PATH, val_audio_conf, stage=2, class_name_to_idx=class_name_to_label_mapping),
+        MavosDD(mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==False and sample["open_set_language"]==False
+                and (sample['generative_method'] != 'real' or sample['audio_generative_method'] != 'real')),
+                DATASET_INPUT_PATH, val_audio_conf, stage=2, video_class_name_to_idx=video_labels, audio_class_name_to_idx=audio_labels),
         batch_size=32, shuffle=False, num_workers=2, pin_memory=False
     )
 

@@ -19,10 +19,10 @@ SPLIT_TO_EVALUATE = "closed-set"
 # SPLIT_TO_EVALUATE = "open-set"
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
-CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3/audio+video_classes_but_just_video_labels"
-CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.10.pth"
-INFERENCE_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS.json"
-PLOT_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.{SPLIT_TO_EVALUATE}.png"
+CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3"
+CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.9.pth"
+INFERENCE_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.9.PREDICTIONS.closed_set.json"
+PLOT_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.9.{SPLIT_TO_EVALUATE}.png"
 
 video_labels = {
     "memo": 0,
@@ -98,7 +98,7 @@ def plot_multilabel_confusion_matrix(y_pred, y_true, class_name_to_label_mapping
     for j in range(idx + 1, len(axes)):
         fig.delaxes(axes[j])
 
-    plt.title(title)
+    # plt.title(title)
     plt.tight_layout()
     plt.savefig(PLOT_OUT_PATH)
     plt.show()
@@ -162,7 +162,8 @@ if __name__ == "__main__":
     mavos_dd = datasets.Dataset.load_from_disk(DATASET_INPUT_PATH)
 
     if SPLIT_TO_EVALUATE == "closed-set":
-        curr_split = mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==False and sample["open_set_language"]==False)
+        curr_split = mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==False and sample["open_set_language"]==False
+                                     and (sample['generative_method'] != 'real' or sample['audio_generative_method'] != 'real'))
     elif SPLIT_TO_EVALUATE == "open-model":
         curr_split = datasets.concatenate_datasets([
             mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==False and sample["open_set_language"]==False),
@@ -191,6 +192,7 @@ if __name__ == "__main__":
     print(f"AUC={list(map(lambda entry: entry['AUC'], stats['per_class']))}")
     print(f"precisions={list(map(lambda entry: entry['precisions'], stats['per_class']))}")
     print(f"recalls={list(map(lambda entry: entry['recalls'], stats['per_class']))}")
+    print("===============")
     print(stats)
 
     multilabel = np.any(np.array(y_true).sum(axis=1) > 1)

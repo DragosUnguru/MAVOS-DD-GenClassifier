@@ -454,18 +454,19 @@ if __name__ == "__main__":
 
     mavos_dd = datasets.Dataset.load_from_disk(input_path)
     uut = MavosDD(
-        mavos_dd.filter(lambda sample: sample['split']=="test"),
+        mavos_dd.filter(lambda sample: sample['split']=="train" and get_audio_label(sample['audio_generative_method']) == 'knnvc'),
         input_path,
         audio_conf,
         stage=2,
         video_class_name_to_idx=video_labels,
         audio_class_name_to_idx=audio_labels)
+    print(len(uut))
 
-    for i in range(0, len(uut), 300):
-        _, _, label, _ = uut[i]
+    # for i in range(0, len(uut), 300):
+    #     _, _, label, _ = uut[i]
 
-        assert torch.sum(label) <= 2, f"The label should not have less than 1 or more than 2 classes. Got: {label}"
-        print(f"video={uut.dataset[i]['generative_method']}, audio={uut.dataset[i]['audio_generative_method']} -> {label}")
+    #     assert torch.sum(label) <= 2, f"The label should not have less than 1 or more than 2 classes. Got: {label}"
+    #     print(f"video={uut.dataset[i]['generative_method']}, audio={uut.dataset[i]['audio_generative_method']} -> {label}")
 
     # input_path = "/mnt/d/projects/datasets/MAVOS-DD"
     # mavos_dd = datasets.Dataset.load_from_disk(input_path)
