@@ -20,9 +20,9 @@ SPLIT_TO_EVALUATE = "closed-set"
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
 CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3"
-CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.9.pth"
-INFERENCE_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.9.PREDICTIONS.closed_set.json"
-PLOT_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.9.{SPLIT_TO_EVALUATE}.png"
+CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.6.pth"
+INFERENCE_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.6.PREDICTIONS.closed_set.json"
+PLOT_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.6.{SPLIT_TO_EVALUATE}.png"
 
 video_labels = {
     "memo": 0,
