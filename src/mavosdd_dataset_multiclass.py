@@ -436,7 +436,7 @@ if __name__ == "__main__":
         'num_mel_bins': 128, 'target_length': 1024, 'freqm': 0, 'timem': 0, 'mode':'train', 
         'mean': -5.081, 'std': 4.4849, 'noise': False, 'label_smooth': 0, 'im_res': 224
     }
-    input_path = "/mnt/d/projects/datasets/MAVOS-DD"
+    input_path = "/home/fl488644/datasets/MAVOS-DD"
 
     video_labels = {
         "memo": 0,

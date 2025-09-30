@@ -7,7 +7,7 @@ from .positional_embedding import SinCosPositionalEmbedding
 class VisualEncoder(nn.Module):
     def __init__(self, img_size=224, patch_size=16, n_frames=16, embed_dim=768, depth=12,
         num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-        norm_layer="LayerNorm", init_values=0., tubelet_size=2
+        norm_layer="LayerNorm", init_values=0., tubelet_size=2, masking_strategy="uniform"
     ):
         super().__init__()
         
@@ -15,10 +15,10 @@ class VisualEncoder(nn.Module):
         self.patch_embedding = PatchEmbedding3d(
             input_size=(3, n_frames, img_size, img_size),
             patch_size=(tubelet_size, patch_size, patch_size),
-            embedding=embed_dim
+            embedding=embed_dim, masking_strategy=masking_strategy
         )
         num_patches = (img_size // patch_size) * (img_size // patch_size) * (n_frames // tubelet_size)
-        
+
         self.pos_embedding = SinCosPositionalEmbedding((num_patches, embed_dim), dropout_rate=0.)
         
         if norm_layer == 'LayerNorm':
@@ -53,13 +53,13 @@ class VisualEncoder(nn.Module):
         x = self.norm(x)
         return x
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, gradcam_map, masking_ratio) -> Tensor:
         # mask: (B, T, N) with boolean values, 0 -> masked, 1 -> visible
         assert len(x.shape) == 5, "x must be 5D"
-        emb = self.patch_embedding(x)
-        emb = self.pos_embedding(emb)
+        emb, keep_indices, original_size = self.patch_embedding(x, gradcam_map, masking_ratio)
+        emb = self.pos_embedding(emb, keep_indices)
         emb = self.forward_features(emb)
-        return emb
+        return emb, keep_indices, original_size
 
     def extract_features(self, x: Tensor, seq_mean_pool: bool) -> Tensor:
         x = self.patch_embedding(x)

@@ -287,6 +287,7 @@ class VideoCAVMAEFT(nn.Module):
         init_values=0.,
         tubelet_size=2,
         norm_pix_loss=True,
+        masking_strategy="uniform"
     ):
         super().__init__()
         
@@ -322,7 +323,8 @@ class VideoCAVMAEFT(nn.Module):
             attn_drop_rate=attn_drop_rate,
             norm_layer=norm_layer,
             init_values=init_values,
-            tubelet_size=tubelet_size
+            tubelet_size=tubelet_size,
+            masking_strategy=masking_strategy
         )
         self.a2v = A2VNetwork(
             audio_dim=64 * self.n_frames // 2,
@@ -364,19 +366,21 @@ class VideoCAVMAEFT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
     
-    def forward(self, audio, video):
+    def forward(self, audio, video, gradcam_map=None, masking_ratio=0.):
         # audio: (B, 1024, 128)
         # video: (B, 3, 16, 224, 224)
         
         # Forward audio and video through their respective encoders
         audio_emb = self.audio_encoder(audio)
-        video_emb = self.visual_encoder(video)
-        
+        video_emb, keep_idx, original_size = self.visual_encoder(video, gradcam_map, masking_ratio)
+        B, N, D = original_size
+        x_full = video_emb.new_zeros(B, N, D)
+        x_full.scatter_(1, keep_idx.unsqueeze(-1).expand(-1, -1, D), video_emb)
         # Rearrange audio and video embeddings to perform temporal complementary mask
         b, t, c = audio_emb.shape
         audio_emb = audio_emb.reshape(b, self.n_frames // 2, -1, c)
-        b, t, c = video_emb.shape
-        video_emb = video_emb.reshape(b, self.n_frames // 2, -1, c)
+        b, t, c = x_full.shape
+        video_emb = x_full.reshape(b, self.n_frames // 2, -1, c)
         
         video_fusion = self.a2v(audio_emb)
         audio_fusion = self.v2a(video_emb)

@@ -64,8 +64,14 @@ class PositionalEmbedding(nn.Module):
         if self.use_dropout:
             self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = x + self.emb
+    def forward(self, x: Tensor, keep_idx = None) -> Tensor:
+        if keep_idx is None:
+            x = x + self.emb
+        else:
+            x = x + self.emb.gather(
+            dim=1,
+            index=keep_idx.unsqueeze(-1).expand(-1, -1, x.size(-1))
+        ) 
         if self.use_dropout:
             x = self.dropout(x)
         return x

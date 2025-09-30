@@ -10,13 +10,22 @@ from torch.utils.data import DataLoader
 from models.video_cav_mae import VideoCAVMAEFT
 from mavosdd_dataset_multiclass import MavosDD
 
-from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam import GradCAM, \
+    ScoreCAM, \
+    GradCAMPlusPlus, \
+    AblationCAM, \
+    XGradCAM, \
+    EigenCAM, \
+    EigenGradCAM, \
+    LayerCAM, \
+    FullGrad
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget, BinaryClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
 
 from pathlib import Path
 from mini_datasets import get_mini_test_set
-
+import torch.nn.functional as F
+import wandb
 
 # Custom target we want to generate the CAM for.
 # Simple sum of activations as the video module has no classification layer
@@ -107,10 +116,11 @@ def gradcam_show(
     target_layers,
     targets,
     reshape_transform=None,
-    dump_file_path='/mnt/d/projects/MAVOS-DD-GenClassifer/exp/gradcam_video.mp4',
+    dump_file_path='/home/fl488644/MAVOS-DD-GenClassifier/exp/gradcam_video.mp4',
     norm_mean=[0.4850, 0.4560, 0.4060],
     norm_std=[0.2290, 0.2240, 0.2250],
-    apply_mask=False
+    apply_mask=False,
+    grad_cam_method = GradCAM
 ):
     # =============================================
     # input_tensor: torch.Size([batch_size x rgb_channels x num_frames x height x width)
@@ -159,30 +169,25 @@ def gradcam_show(
     # Generate CAM visualizations and save to disk
     wrapped_model = ModelWrapper(model, fixed_audio_tensor=input_audio)
     all_visualizations = []
-
-    with GradCAM(model=wrapped_model, target_layers=target_layers, reshape_transform=reshape_transform) as cam:
-        for temporal_idx in range(temporal_dimension_size):
-            grayscale_cam = cam(input_tensor=input_video, targets=targets)
-            grayscale_cam = grayscale_cam[0, temporal_idx]
-
-            if apply_mask:
-                all_visualizations.append(
-                    apply_cam_mask(rgb_img=rgb_img_collection[temporal_idx], grayscale_cam=grayscale_cam, mode="hard", threshold=0.5)
-                )
-            else:
-                all_visualizations.append(
-                    show_cam_on_image(rgb_img_collection[temporal_idx], grayscale_cam, use_rgb=True)
-                )
-
-    dump_cam_to_disk(all_visualizations, dump_file_path)
-
+    methods = {"gradcam": GradCAM,
+         "scorecam": ScoreCAM,
+         "gradcam++": GradCAMPlusPlus,
+         "xgradcam": XGradCAM,
+         "eigencam": EigenCAM,
+         "eigengradcam": EigenGradCAM,
+         "layercam": LayerCAM,
+         "fullgrad": FullGrad}
+    with methods[grad_cam_method](model=wrapped_model, target_layers=target_layers, reshape_transform=reshape_transform) as cam:
+        print(input_video.shape)
+        grayscale_cam = cam(input_tensor=input_video, targets=targets)
+        return grayscale_cam
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Video CAV-MAE')
 
     parser.add_argument('--batch-size', default=1, type=int, help='batch size')
     parser.add_argument('--num_workers', default=4, type=int, help='number of workers')
-    parser.add_argument('--model_weights_path', default='/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3/models/audio_model.8.pth', type=str, help='the path to the CAVMAEFT model weights on the MAVOS-DD dataset')
+    parser.add_argument('--model_weights_path', default='/home/fl488644/MAVOS-DD-GenClassifier/exp/classification_model_4+5_classes.8.pth', type=str, help='the path to the CAVMAEFT model weights on the MAVOS-DD dataset')
     parser.add_argument('--target_length', default=1024, type=int, help='audio target length')
     parser.add_argument('--freqm', help='frequency mask max length', type=int, default=0)
     parser.add_argument('--timem', help='time mask max length', type=int, default=0)
@@ -191,10 +196,11 @@ if __name__ == '__main__':
     parser.add_argument('--noise', default=False, type=bool, help='add noise to the input')
     parser.add_argument('--mae_loss_weight', type=float, default=3.0, help='weight for mae loss')
     parser.add_argument('--contrast_loss_weight', type=float, default=0.01, help='weight for contrastive loss')
-
+    parser.add_argument("--masking_strategy", type=str)
+    parser.add_argument("--gradcam_method", type=str)
     args = parser.parse_args()
 
-    input_path = '/mnt/d/projects/datasets/MAVOS-DD'
+    input_path = '/home/fl488644/datasets/MAVOS-DD'
     im_res = 224
     audio_conf = {'num_mel_bins': 128, 'target_length': args.target_length, 'freqm': args.freqm, 'timem': args.timem, 'mode':'train',
                 'mean':args.dataset_mean, 'std':args.dataset_std, 'noise':args.noise, 'label_smooth': 0, 'im_res': im_res}
@@ -202,6 +208,10 @@ if __name__ == '__main__':
                 'mean': args.dataset_mean, 'std': args.dataset_std, 'noise': False, 'im_res': im_res}
 
     print('current mae loss {:.3f}, and contrastive loss {:.3f}'.format(args.mae_loss_weight, args.contrast_loss_weight))
+    wandb.init(project="AVFF masking", 
+               config=vars(args), 
+               name=f"Masking strategy: {args.masking_strategy} ({args.gradcam_method})")
+
 
     # Load dataset for which to generate CAMs for
     # mavos_dd = datasets.Dataset.load_from_disk(input_path).filter(lambda sample: sample['split']=='train' and sample['generative_method'] == 'liveportrait')
@@ -231,7 +241,7 @@ if __name__ == '__main__':
     }
     class_name_to_label_mapping = { **video_labels, **audio_labels }
 
-    cavmae_ft = VideoCAVMAEFT(n_classes=len(class_name_to_label_mapping))
+    cavmae_ft = VideoCAVMAEFT(n_classes=len(class_name_to_label_mapping), masking_strategy = args.masking_strategy)
     if not isinstance(cavmae_ft, torch.nn.DataParallel):
         cavmae_ft = torch.nn.DataParallel(cavmae_ft)
 
@@ -259,39 +269,62 @@ if __name__ == '__main__':
         tensor = tensor.view(B, Nt, Nh, Nw, D)   # (B, Nt, Nh, Nw, D)
         tensor = tensor.permute(0, 4, 1, 2, 3)   # (B, D, Nt, Nh, Nw)
         return tensor
-
-
-    count_to_generate = 10    
-    for (audio_input, video_input, labels, video_path) in test_loader:
-        unbatched_label = labels[0]
-        unbatched_video_path = video_path[0]
-
-        (language, generative_method, video_name) = unbatched_video_path.split(os.path.sep)
+    gradcam_dict = {}
+    for masking_ratio in np.linspace(0.0, 1, 10):
+        count_to_generate = 100
+        gt = []
+        preds = []
+        correct = 0
+        confidences = []
+        n_samples = 0
         
-        dump_file_path = Path(f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{language}/{generative_method}/MASKED_{video_name}')
-        dump_file_path.parent.mkdir(exist_ok=True, parents=True)
+        for i, (audio_input, video_input, labels, video_path) in enumerate(test_loader):
+            unbatched_label = labels[0]
+            unbatched_video_path = video_path[0]
 
-        print(f'Generating {dump_file_path}...')
+            (language, generative_method, video_name) = unbatched_video_path.split(os.path.sep)
+            
+            dump_file_path = Path(f'/home/fl488644/MAVOS-DD-GenClassifier/exp/{language}/{generative_method}/MASKED_{video_name}')
+            dump_file_path.parent.mkdir(exist_ok=True, parents=True)
 
-        audio_input = audio_input.to(device)
-        video_input = video_input.to(device)
+            print(f'Generating {dump_file_path}...')
 
-        gradcam_show(
-            model=cavmae_ft.module,
-            input_video=video_input,
-            input_audio=audio_input,
-            target_layers=[
-                # target_layers=[cavmae_ft.module.visual_encoder.patch_embedding.projection], # convolutional layer
-                cavmae_ft.module.visual_encoder.blocks[11].attn.proj,             # last attention projection
-                cavmae_ft.module.visual_encoder.blocks[11].mlp.layers[1].linear,  # last MLP linear
-                cavmae_ft.module.visual_encoder.norm                              # final LN
-            ],
-            targets=[ClassifierOutputTarget(class_name_to_label_mapping['liveportrait'])],
-            reshape_transform=reshape_transform_temporal,
-            dump_file_path=dump_file_path,
-            apply_mask=True
+            audio_input = audio_input.to(device)
+            video_input = video_input.to(device)
+            if i not in gradcam_dict:
+                gradcam_map = gradcam_show(
+                    model=cavmae_ft.module,
+                    input_video=video_input,
+                    input_audio=audio_input,
+                    target_layers=[
+                        # target_layers=[cavmae_ft.module.visual_encoder.patch_embedding.projection], # convolutional layer
+                        cavmae_ft.module.visual_encoder.blocks[11].attn.proj,             # last attention projection
+                        cavmae_ft.module.visual_encoder.blocks[11].mlp.layers[1].linear,  # last MLP linear
+                        cavmae_ft.module.visual_encoder.norm                              # final LN
+                    ],
+                    targets=[ClassifierOutputTarget(torch.argmax(labels, dim=1).squeeze())],
+                    reshape_transform=reshape_transform_temporal,
+                    dump_file_path=dump_file_path,
+                    apply_mask=True,
+                    grad_cam_method = args.gradcam_method
+                )
+                gradcam_dict[i]=gradcam_map
+            with torch.no_grad():
+                predictions = F.sigmoid(cavmae_ft.module(audio_input, video_input, torch.from_numpy(gradcam_dict[i]).float().to(device), masking_ratio))
+            binary_predictions = (predictions>0.5).to(torch.int).cpu()
+            correct +=  (binary_predictions.eq(labels).all(dim=1)).sum().item()
+            n_samples += labels.size(0)
+            confidences.extend(predictions.amax(dim=1).cpu().numpy())
+        # print(gt.shape, preds.shape)
+        # print(preds[:10])
+        # exit()
+        average_confidence = np.mean(confidences)
+        wandb.log(
+            {"accuracy": correct/n_samples, "confidence": average_confidence, "masking_ratio": masking_ratio}
         )
-
-        count_to_generate -= 1
-        if count_to_generate == 0:
-            break
+            # print(torch.argmax(labels, dim=1).squeeze())
+            # print(predictions)
+        
+        # count_to_generate -= 1
+        # if count_to_generate == 0:
+        #     break

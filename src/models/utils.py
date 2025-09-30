@@ -16,7 +16,8 @@ class PatchEmbedding3d(nn.Module):
 
     def __init__(self, input_size: Shape, patch_size: Union[int, Shape], embedding: int,
         strides: Optional[Union[int, Shape]] = None,
-        build_normalization: Optional[ModuleFactory] = None
+        build_normalization: Optional[ModuleFactory] = None,
+        masking_strategy="uniform"
     ):
         super().__init__()
         # channel, time, height, width
@@ -37,13 +38,52 @@ class PatchEmbedding3d(nn.Module):
         if self.has_norm:
             self.normalization = build_normalization()
         self.rearrange = Rearrange("b d nt nh nw -> b (nt nh nw) d")
+        self._kernel = (pt, ph, pw)
+        self._stride = tuple(self.projection.stride)
+        self.masking_strategy=masking_strategy
 
-    def forward(self, x: Tensor) -> Tensor:
+
+    def forward(self, x: Tensor, gradcam_map = None, drop_ratio=0.) -> Tensor:
         x = self.projection(x)
         x = self.rearrange(x)
         if self.has_norm:
             x = self.normalization(x)
-        return x
+        N=x.size(1)
+        if gradcam_map is None or drop_ratio <= 0.0:
+            N = x.size(1)
+            keep_idx = torch.arange(N, device=x.device).expand(x.size(0), N)
+            return x, keep_idx, x.size()
+        num_drop = min(int(round(drop_ratio * N)), N - 1) 
+        num_keep = N - num_drop
+        if self.masking_strategy == "uniform":
+            rand_scores = torch.rand(x.size(0), N, device=x.device)
+            keep_idx = rand_scores.topk(k=num_keep, dim=1, largest=True, sorted=False).indices
+        else:
+            if gradcam_map.dim() == 4:              # [B,T,H,W]
+                gradcam_map = gradcam_map.unsqueeze(1)
+            elif gradcam_map.dim() == 5 and gradcam_map.size(1) != 1:
+                gradcam_map = gradcam_map.mean(dim=1, keepdim=True)  # [B,C,T,H,W]
+
+            gradcam_map = gradcam_map.clamp_(0.0, 1.0)
+
+            k_t, k_h, k_w = self._kernel
+            s_t, s_h, s_w = self._stride
+            avg = F.avg_pool3d(
+                gradcam_map, kernel_size=(k_t, k_h, k_w), stride=(s_t, s_h, s_w), padding=0
+            ) 
+
+            avg = avg.flatten(1)  
+            N = avg.size(1)
+
+            keep_scores, keep_idx = torch.topk(avg, k=num_keep, dim=1, largest=False, sorted=False)
+            print(f"Index shape: {keep_idx}")
+            print(f"Signal shape: {x.shape}")
+        x_kept = x.gather(
+            dim=1,
+            index=keep_idx.unsqueeze(-1).expand(-1, -1, x.size(-1))
+        ) 
+        original_size = x.size()
+        return x_kept, keep_idx, original_size
 
 
 class Linear(nn.Module):
