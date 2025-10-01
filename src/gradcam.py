@@ -33,19 +33,21 @@ class FeatureArgMaxTarget:
         return model_output.arg_max(dim=1)
 
 
-def dump_cam_to_disk(visualizations, dump_file_path):
-    if isinstance(visualizations, list):
-        # Multiple frames. Dump video to disk
-        height, width, _ = visualizations[0].shape
-        out = cv2.VideoWriter(dump_file_path, cv2.VideoWriter_fourcc(*'mp4v'), 10, (width, height))
+def dump_cam_to_disk(visualizations, dump_file_path, fps=25):
+    assert visualizations.ndim in [3, 4], f"Can only dump images (H x W x Ch) or videos (T x H x W x Ch). Got shape: {visualizations.shape}"
 
-        for vis in visualizations:
-            for _ in range(8): # Repeat each frame several times for better visualisation in video playback
-                out.write(cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-        out.release()
+    if visualizations.ndim == 4:
+        # Multiple frames. Dump video to disk
+        num_frames, height, width, _ = visualizations.shape
+        out = cv2.VideoWriter(dump_file_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+
+        for t in range(num_frames):
+            out.write(cv2.cvtColor(visualizations[t], cv2.COLOR_RGB2BGR))
     else:
         # Single frame. Dump image to disk
         cv2.imwrite(dump_file_path, visualizations)
+
+    out.release()
 
 
 def apply_cam_mask(
@@ -95,6 +97,59 @@ def apply_cam_mask(
     return np.uint8(np.clip(masked_img * 255, 0, 255))
 
 
+def pool_cam(
+    rgb_video: np.ndarray,
+    grayscale_cam: np.ndarray,
+    kernel_size=(2, 16, 16),
+    stride=(2, 16, 16),
+    padding=0) -> np.ndarray:
+    """
+    Apply average pooling to a Grad-CAM heatmap.
+
+    Parameters
+    ----------
+    grayscale_cam : np.ndarray
+        Heatmap array of shape (T, H, W).
+
+    Returns
+    -------
+    pooled : np.ndarray
+        Downsampled heatmap of shape (T/2, H/16, W/16).
+    """
+    assert rgb_video.ndim == 4 and rgb_video.shape[-1] == 3, "rgb_video must have shape (T, H, W, 3)"
+    assert grayscale_cam.ndim == 3, "grayscale_cam must have shape (T, H, W)"
+
+    T, H, W, _ = rgb_video.shape
+    assert grayscale_cam.shape == (T, H, W), "rgb_video and grayscale_cam must have matching (T, H, W)"
+
+    # ---- Pool RGB video ----
+    video_tensor = torch.from_numpy(rgb_video).permute(3, 0, 1, 2)  # (3, T, H, W)
+    video_tensor = video_tensor.unsqueeze(0)  # (1, 3, T, H, W)
+
+    pooled_video = nn.functional.avg_pool3d(
+        video_tensor.float(),
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding
+    )
+    pooled_video = pooled_video.squeeze(0).permute(1, 2, 3, 0)  # (T/2, H/16, W/16, 3)
+    pooled_video = pooled_video.cpu().numpy()
+
+    # ---- Pool grayscale CAM ----
+    # Add (batch_size, channels) dimension to grayscale CAM
+    cam_tensor = torch.from_numpy(grayscale_cam).unsqueeze(0).unsqueeze(0)  # (1, 1, T, H, W)
+
+    pooled_cam = nn.functional.avg_pool3d(
+        cam_tensor.float(),
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding
+    )
+    pooled_cam = pooled_cam.squeeze(0).squeeze(0).cpu().numpy()  # (T/2, H/16, W/16)
+
+    return pooled_video, pooled_cam
+
+
 '''
     Generates the CAM visualisation for the given model and model's input tensor.
     The output is a .mp4 video of the 16 frames (in AVFF's case) of the first entry from the batch
@@ -104,13 +159,15 @@ def gradcam_show(
     model,
     input_video,
     input_audio,
+    y_true,
     target_layers,
     targets,
     reshape_transform=None,
-    dump_file_path='/mnt/d/projects/MAVOS-DD-GenClassifer/exp/gradcam_video.mp4',
+    dump_file_path=None,
     norm_mean=[0.4850, 0.4560, 0.4060],
     norm_std=[0.2290, 0.2240, 0.2250],
-    apply_mask=False
+    apply_mask=False,
+    skip_if_mislabeled=False
 ):
     # =============================================
     # input_tensor: torch.Size([batch_size x rgb_channels x num_frames x height x width)
@@ -161,20 +218,34 @@ def gradcam_show(
     all_visualizations = []
 
     with GradCAM(model=wrapped_model, target_layers=target_layers, reshape_transform=reshape_transform) as cam:
+        grayscale_cams = cam(input_tensor=input_video, targets=targets)[0]
+
+        if skip_if_mislabeled == True:
+            y_pred = torch.round(torch.sigmoid(torch.Tensor(cam.outputs[0]))).cpu()
+
+            if not torch.equal(y_pred, y_true):
+                print(f"Skipping as y_pred != y_true")
+                return None, None, None
+
         for temporal_idx in range(temporal_dimension_size):
-            grayscale_cam = cam(input_tensor=input_video, targets=targets)
-            grayscale_cam = grayscale_cam[0, temporal_idx]
+            grayscale_cam = grayscale_cams[temporal_idx]
 
             if apply_mask:
                 all_visualizations.append(
-                    apply_cam_mask(rgb_img=rgb_img_collection[temporal_idx], grayscale_cam=grayscale_cam, mode="hard", threshold=0.5)
+                    apply_cam_mask(rgb_img=rgb_img_collection[temporal_idx], grayscale_cam=grayscale_cam, mode="hard", threshold=0.4)
                 )
             else:
                 all_visualizations.append(
                     show_cam_on_image(rgb_img_collection[temporal_idx], grayscale_cam, use_rgb=True)
                 )
 
-    dump_cam_to_disk(all_visualizations, dump_file_path)
+    rgb_img_collection = np.stack(rgb_img_collection)
+    overlayed_video = np.stack(all_visualizations)
+
+    if dump_file_path is not None:
+        dump_cam_to_disk(overlayed_video, dump_file_path)
+
+    return overlayed_video, rgb_img_collection, grayscale_cams
 
 
 if __name__ == '__main__':
@@ -261,37 +332,65 @@ if __name__ == '__main__':
         return tensor
 
 
-    count_to_generate = 10    
+    count = 3
     for (audio_input, video_input, labels, video_path) in test_loader:
         unbatched_label = labels[0]
         unbatched_video_path = video_path[0]
 
         (language, generative_method, video_name) = unbatched_video_path.split(os.path.sep)
         
-        dump_file_path = Path(f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{language}/{generative_method}/MASKED_{video_name}')
-        dump_file_path.parent.mkdir(exist_ok=True, parents=True)
+        # dump_file_path = Path(f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{language}/{generative_method}/POOLED_{video_name}')
+        # dump_file_path.parent.mkdir(exist_ok=True, parents=True)
 
-        print(f'Generating {dump_file_path}...')
+        # print(f'Generating {dump_file_path}...')
 
         audio_input = audio_input.to(device)
         video_input = video_input.to(device)
 
-        gradcam_show(
+        _, rgb_video, grayscale_video = gradcam_show(
             model=cavmae_ft.module,
             input_video=video_input,
             input_audio=audio_input,
+            y_true=unbatched_label,
             target_layers=[
                 # target_layers=[cavmae_ft.module.visual_encoder.patch_embedding.projection], # convolutional layer
                 cavmae_ft.module.visual_encoder.blocks[11].attn.proj,             # last attention projection
                 cavmae_ft.module.visual_encoder.blocks[11].mlp.layers[1].linear,  # last MLP linear
                 cavmae_ft.module.visual_encoder.norm                              # final LN
             ],
-            targets=[ClassifierOutputTarget(class_name_to_label_mapping['liveportrait'])],
+            targets=[
+                ClassifierOutputTarget(label_idx)
+                for label_idx in unbatched_label.nonzero(as_tuple=True)[0].tolist()
+            ],
             reshape_transform=reshape_transform_temporal,
-            dump_file_path=dump_file_path,
-            apply_mask=True
+            # dump_file_path=dump_file_path,
+            apply_mask=False,
+            skip_if_mislabeled=False
         )
 
-        count_to_generate -= 1
-        if count_to_generate == 0:
-            break
+        # Overlay the gradient map over the video
+        # after pooling both (video and its heatmap)
+        if rgb_video is not None and grayscale_video is not None:
+            rgb_video, grayscale_video = pool_cam(rgb_video, grayscale_video)
+            overlayed_video = []
+
+            for frame_idx in range(rgb_video.shape[0]):
+                overlayed_video.append(
+                    show_cam_on_image(rgb_video[frame_idx], grayscale_video[frame_idx], use_rgb=True)
+                )
+
+            video_name = video_name.partition(".")[0]
+            root_file_path = Path(f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{language}/{generative_method}/{video_name}')
+            video_dump_path = Path(f'{root_file_path}/rgb_original_video.npy')
+            heatmap_dump_path = Path(f'{root_file_path}/heatmap_grayscale.npy')
+            overlayed_dump_path = Path(f'{root_file_path}/overlayed_video.npy')
+            
+            video_dump_path.parent.mkdir(exist_ok=True, parents=True)
+
+            print(f'Generating {root_file_path}...')
+
+            np.save(video_dump_path, rgb_video)
+            np.save(heatmap_dump_path, grayscale_video)
+            np.save(overlayed_dump_path, np.stack(overlayed_video))
+
+            # dump_cam_to_disk(np.stack(overlayed_video), dump_file_path, fps=1)
