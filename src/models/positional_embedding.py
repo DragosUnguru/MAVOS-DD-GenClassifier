@@ -68,7 +68,13 @@ class PositionalEmbedding(nn.Module):
         if keep_idx is None:
             x = x + self.emb
         else:
-            x = x + self.emb.gather(
+        #     print(x.shape, keep_idx.unsqueeze(-1).expand(-1, -1, x.size(-1)).shape)
+        #     print(self.emb.gather(
+        #     dim=1,
+        #     index=keep_idx.unsqueeze(-1).expand(-1, -1, x.size(-1))
+        # ).shape)
+            emb = self.emb.expand(x.size(0), -1, -1)
+            x = x + emb.gather(
             dim=1,
             index=keep_idx.unsqueeze(-1).expand(-1, -1, x.size(-1))
         ) 

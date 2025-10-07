@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.cuda.amp import autocast, GradScaler
-
+from tqdm import tqdm
+import wandb
 def train(model, train_loader, test_loader, args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.set_grad_enabled(True)
@@ -83,13 +84,14 @@ def train(model, train_loader, test_loader, args):
         print("current #epochs=%s, #steps=%s" % (epoch, global_step))
         
         start_time = time.time()
-        for i, (a_input, v_input, labels, _) in enumerate(train_loader):
+        for i, (a_input, v_input, labels, _, gradcam_map) in enumerate(tqdm(train_loader)):
             # print(f"step 1: ", time.time() - start_time)
             # start_time = time.time()
             assert a_input.shape[0] == v_input.shape[0]
             B = a_input.shape[0]
             a_input = a_input.to(device, non_blocking=True)
             v_input = v_input.to(device, non_blocking=True)
+            gradcam_map = gradcam_map.to(device, non_blocking=True)
             labels = labels.to(device)
             
             data_time.update(time.time() - end_time)
@@ -99,7 +101,7 @@ def train(model, train_loader, test_loader, args):
             # print(f"step 2: ", time.time() - start_time)
             # start_time = time.time()
             with autocast():
-                output = model(a_input, v_input)
+                output = model(a_input, v_input, masking_ratio = args.masking_rate, gradcam_map=gradcam_map)
                 # print(f"step 3: ", time.time() - start_time)
                 # start_time = time.time()
                 loss = loss_fn(output, labels)
@@ -131,6 +133,7 @@ def train(model, train_loader, test_loader, args):
                   'Train Loss {loss_meter.val:.4f}\t'.format(
                    epoch, i, len(train_loader), per_sample_time=per_sample_time, per_sample_data_time=per_sample_data_time,
                       per_sample_dnn_time=per_sample_dnn_time, loss_meter=loss_meter), flush=True)
+                wandb.log({"Train Loss": loss_meter.avg})
                 if np.isnan(loss_meter.avg):
                     print("training diverged...")
                     return
@@ -160,6 +163,12 @@ def train(model, train_loader, test_loader, args):
         print("train_loss: {:.6f}".format(loss_meter.avg))
         print("valid_loss: {:.6f}".format(valid_loss))
 
+        wandb.log({"AUC": mAUC, "Accuracy": acc, "mAP": mAP, "train_loss": loss_meter.avg, "valid_loss": valid_loss})
+        print("d_prime: {:.6f}".format(d_prime(mAUC)))
+        print("train_loss: {:.6f}".format(loss_meter.avg))
+        print("valid_loss: {:.6f}".format(valid_loss))
+
+
         result[epoch-1, :] = [acc, mAP, mAUC, optimizer.param_groups[0]['lr']]
         np.savetxt(exp_dir + '/result.csv', result, delimiter=',')
         print('validation finished')
@@ -173,12 +182,13 @@ def train(model, train_loader, test_loader, args):
             best_acc = acc
             if main_metrics == 'acc':
                 best_epoch = epoch
-
+        if not os.path.exists("%s/models/%f"% (exp_dir, args.masking_rate)):
+            os.makedirs("%s/models/%f"% (exp_dir, args.masking_rate))
         if best_epoch == epoch:
-            torch.save(model.state_dict(), "%s/models/best_audio_model.pth" % (exp_dir))
-            torch.save(optimizer.state_dict(), "%s/models/best_optim_state.pth" % (exp_dir))
+            torch.save(model.state_dict(), "%s/models/%f/best_audio_model.pth" % (exp_dir, args.masking_rate))
+            torch.save(optimizer.state_dict(), "%s/models/%f/best_optim_state.pth" % (exp_dir, args.masking_rate))
         if args.save_model == True:
-            torch.save(model.state_dict(), "%s/models/audio_model.%d.pth" % (exp_dir, epoch))
+            torch.save(model.state_dict(), "%s/models/%f/audio_model.%d.pth" % (exp_dir, args.masking_rate, epoch))
         
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             if main_metrics == 'mAP':
@@ -213,7 +223,7 @@ def validate(model, val_loader, args, output_pred=False):
     end = time.time()
     A_predictions, A_targets, A_loss = [], [], []
     with torch.no_grad():
-        for i, (a_input, v_input, labels, _) in enumerate(val_loader):
+        for i, (a_input, v_input, labels, _, _) in enumerate(tqdm(val_loader)):
             a_input = a_input.to(device)
             v_input = v_input.to(device)
             labels = labels.to(device)
