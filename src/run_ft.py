@@ -7,7 +7,10 @@ from models.video_cav_mae import VideoCAVMAEFT
 from traintest_ft import train
 import warnings
 
-from mavosdd_dataset_multiclass import MavosDD
+from mavosdd_dataset import MavosDD
+# from mavosdd_dataset_multiclass import MavosDD
+from mini_datasets import get_mini_test_set, get_mini_train_set_deepfake_detection
+
 
 
 parser = argparse.ArgumentParser(description='Video CAV-MAE')
@@ -26,8 +29,8 @@ parser.add_argument("--metrics", type=str, default="mAP", help="the main evaluat
 parser.add_argument("--loss", type=str, default="BCE", help="the loss function for finetuning, depend on the task", choices=["BCE", "CE"])
 parser.add_argument('--n-epochs', default=10, type=int, help='number of epochs')
 parser.add_argument('--n_classes', default=2, type=int, help='Num of classes to be classified')
-parser.add_argument('--save-dir', default='checkpoints', type=str, help='directory to save checkpoints')
-parser.add_argument('--pretrain_path', default=None, type=str, help='path to pretrain model')
+parser.add_argument('--save-dir', default='checkpoints/binary_classification', type=str, help='directory to save checkpoints')
+parser.add_argument('--pretrain_path', default='/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/stage-3.pth', type=str, help='path to pretrain model')
 parser.add_argument("--contrast_loss_weight", type=float, default=0.01, help="weight for contrastive loss")
 parser.add_argument("--mae_loss_weight", type=float, default=3.0, help="weight for mae loss")
 parser.add_argument('--save_model', default=True)
@@ -57,48 +60,61 @@ print('current mae loss {:.3f}, and contrastive loss {:.3f}'.format(args.mae_los
 
 # Construct dataloader
 input_path = "/mnt/d/projects/datasets/MAVOS-DD"
-video_labels = {
-    "memo": 0,
-    "liveportrait": 1,
-    "inswapper": 2,
-    "echomimic": 3,
-}
-audio_labels = {
-    "knnvc": 4,
-    "freevc": 5,
-    "openvoice": 6,
-    "xtts_v2": 7,
-    "yourtts": 8,
-}
-class_name_to_label_mapping = { **video_labels, **audio_labels }
+# video_labels = {
+#     "memo": 0,
+#     "liveportrait": 1,
+#     "inswapper": 2,
+#     "echomimic": 3,
+# }
+# audio_labels = {
+#     "knnvc": 4,
+#     "freevc": 5,
+#     "openvoice": 6,
+#     "xtts_v2": 7,
+#     "yourtts": 8,
+# }
+# class_name_to_label_mapping = { **video_labels, **audio_labels }
 
-mavos_dd = datasets.Dataset.load_from_disk(input_path)
+# mavos_dd = datasets.Dataset.load_from_disk(input_path)
 
+# train_loader = DataLoader(
+#     MavosDD(
+#         mavos_dd.filter(lambda sample: sample['split']=="train" and (sample['generative_method'] != "real" or sample['audio_generative_method'] != "real")),
+#         input_path,
+#         audio_conf,
+#         stage=2,
+#         video_class_name_to_idx=video_labels,
+#         audio_class_name_to_idx=audio_labels),
+#     batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True
+# )
+mavos_dd = get_mini_train_set_deepfake_detection(input_path)
 train_loader = DataLoader(
     MavosDD(
-        mavos_dd.filter(lambda sample: sample['split']=="train" and (sample['generative_method'] != "real" or sample['audio_generative_method'] != "real")),
+        mavos_dd,
         input_path,
         audio_conf,
+        # video_class_name_to_idx=video_labels,
+        # audio_class_name_to_idx=audio_labels,
         stage=2,
-        video_class_name_to_idx=video_labels,
-        audio_class_name_to_idx=audio_labels),
-    batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True
+        custom_file_path=True),
+    batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False
 )
 val_loader = DataLoader(
     MavosDD(
-        mavos_dd.filter(lambda sample: sample['split']=="validation" and (sample['generative_method'] != "real" or sample['audio_generative_method'] != "real")),
+        datasets.Dataset.load_from_disk(input_path).filter(lambda sample: sample['split']=="validation"),# and (sample['generative_method'] != "real" or sample['audio_generative_method'] != "real")),
         input_path,
         val_audio_conf,
         stage=2,
-        video_class_name_to_idx=video_labels,
-        audio_class_name_to_idx=audio_labels),
+        custom_file_path=False),
+        # video_class_name_to_idx=video_labels,
+        # audio_class_name_to_idx=audio_labels),
     batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=True
 )
 
 print(f"Using Train: {len(train_loader)}, Eval: {len(val_loader)}")
 
 # Load pre-trained AVFF model & weights
-cavmae_ft = VideoCAVMAEFT(n_classes=len(class_name_to_label_mapping))
+cavmae_ft = VideoCAVMAEFT(n_classes=args.n_classes)#len(class_name_to_label_mapping))
 if not isinstance(cavmae_ft, torch.nn.DataParallel):
     cavmae_ft = torch.nn.DataParallel(cavmae_ft)
 
@@ -109,8 +125,8 @@ if args.pretrain_path is not None:
     print(f'Running on {device}')
 
     # Ignore weights of last FC layer
-    del mdl_weight['module.mlp_head.fc3.weight']
-    del mdl_weight['module.mlp_head.fc3.bias']
+    # del mdl_weight['module.mlp_head.fc3.weight']
+    # del mdl_weight['module.mlp_head.fc3.bias']
 
     miss, unexpected = cavmae_ft.load_state_dict(mdl_weight, strict=False)
 

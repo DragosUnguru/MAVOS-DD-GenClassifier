@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.cuda.amp import autocast, GradScaler
+from tqdm import tqdm
 
 def train(model, train_loader, test_loader, args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -81,9 +82,9 @@ def train(model, train_loader, test_loader, args):
         print('---------------')
         print(datetime.datetime.now())
         print("current #epochs=%s, #steps=%s" % (epoch, global_step))
-        
+
         start_time = time.time()
-        for i, (a_input, v_input, labels, _) in enumerate(train_loader):
+        for i, (a_input, v_input, labels, _) in enumerate(tqdm(train_loader)):
             # print(f"step 1: ", time.time() - start_time)
             # start_time = time.time()
             assert a_input.shape[0] == v_input.shape[0]
@@ -213,7 +214,7 @@ def validate(model, val_loader, args, output_pred=False):
     end = time.time()
     A_predictions, A_targets, A_loss = [], [], []
     with torch.no_grad():
-        for i, (a_input, v_input, labels, _) in enumerate(val_loader):
+        for i, (a_input, v_input, labels, _) in enumerate(tqdm(val_loader)):
             a_input = a_input.to(device)
             v_input = v_input.to(device)
             labels = labels.to(device)

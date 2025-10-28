@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from models.video_cav_mae import VideoCAVMAEFT
 from mavosdd_dataset_multiclass import MavosDD
@@ -15,7 +16,7 @@ from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget, BinaryC
 from pytorch_grad_cam.utils.image import show_cam_on_image
 
 from pathlib import Path
-from mini_datasets import get_mini_test_set
+from mini_datasets import get_mini_test_set, get_mini_train_set_deepfake_detection
 
 
 # Custom target we want to generate the CAM for.
@@ -85,7 +86,7 @@ def apply_cam_mask(
     if mode == "soft":
         mask = grayscale_cam
     else:  # hard
-        mask = (grayscale_cam >= threshold).astype(np.float32)
+        mask = (grayscale_cam <= 1.0 - threshold).astype(np.float32)
 
     # Expand to 3 channels
     mask_3 = np.repeat(mask[:, :, np.newaxis], 3, axis=2)
@@ -218,6 +219,7 @@ def gradcam_show(
     all_visualizations = []
 
     with GradCAM(model=wrapped_model, target_layers=target_layers, reshape_transform=reshape_transform) as cam:
+        # print(targets)
         grayscale_cams = cam(input_tensor=input_video, targets=targets)[0]
 
         if skip_if_mislabeled == True:
@@ -275,18 +277,6 @@ if __name__ == '__main__':
     print('current mae loss {:.3f}, and contrastive loss {:.3f}'.format(args.mae_loss_weight, args.contrast_loss_weight))
 
     # Load dataset for which to generate CAMs for
-    # mavos_dd = datasets.Dataset.load_from_disk(input_path).filter(lambda sample: sample['split']=='train' and sample['generative_method'] == 'liveportrait')
-    # test_loader = DataLoader(
-    #     MavosDD(
-    #         mavos_dd,
-    #         input_path,
-    #         audio_conf,
-    #         stage=2),
-    #     batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False
-    # )
-    test_loader = get_mini_test_set(args.batch_size, audio_conf, args.num_workers, shuffle=False)
-
-    # Load pre-trained AVFF model & weights
     video_labels = {
         "memo": 0,
         "liveportrait": 1,
@@ -302,6 +292,20 @@ if __name__ == '__main__':
     }
     class_name_to_label_mapping = { **video_labels, **audio_labels }
 
+    # mavos_dd = datasets.Dataset.load_from_disk(input_path).filter(lambda sample: sample['split']=="train" and (sample['generative_method'] != "real" or sample['audio_generative_method'] != "real"))
+    mavos_dd = get_mini_train_set_deepfake_detection(input_path)
+    test_loader = DataLoader(
+        MavosDD(
+            mavos_dd,
+            input_path,
+            audio_conf,
+            video_class_name_to_idx=video_labels,
+            audio_class_name_to_idx=audio_labels,
+            stage=2),
+        batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False
+    )
+
+    # Load pre-trained AVFF model & weights
     cavmae_ft = VideoCAVMAEFT(n_classes=len(class_name_to_label_mapping))
     if not isinstance(cavmae_ft, torch.nn.DataParallel):
         cavmae_ft = torch.nn.DataParallel(cavmae_ft)
@@ -331,18 +335,17 @@ if __name__ == '__main__':
         tensor = tensor.permute(0, 4, 1, 2, 3)   # (B, D, Nt, Nh, Nw)
         return tensor
 
-
-    count = 3
-    for (audio_input, video_input, labels, video_path) in test_loader:
+    for (audio_input, video_input, labels, video_path) in tqdm(test_loader):
         unbatched_label = labels[0]
         unbatched_video_path = video_path[0]
 
         (language, generative_method, video_name) = unbatched_video_path.split(os.path.sep)
         
         # dump_file_path = Path(f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{language}/{generative_method}/POOLED_{video_name}')
-        # dump_file_path.parent.mkdir(exist_ok=True, parents=True)
+        dump_file_path = Path(f'/mnt/d/projects/MAVOS-DD-GenClassifer/subset/{language}/{generative_method}/{video_name}/masked_video.mp4')
+        dump_file_path.parent.mkdir(exist_ok=True, parents=True)
 
-        # print(f'Generating {dump_file_path}...')
+        print(f'Generating {dump_file_path}...')
 
         audio_input = audio_input.to(device)
         video_input = video_input.to(device)
@@ -358,39 +361,39 @@ if __name__ == '__main__':
                 cavmae_ft.module.visual_encoder.blocks[11].mlp.layers[1].linear,  # last MLP linear
                 cavmae_ft.module.visual_encoder.norm                              # final LN
             ],
-            targets=[
-                ClassifierOutputTarget(label_idx)
-                for label_idx in unbatched_label.nonzero(as_tuple=True)[0].tolist()
-            ],
+
+            targets=[ClassifierOutputTarget(torch.argmax(labels, dim=1).squeeze())],
+
             reshape_transform=reshape_transform_temporal,
-            # dump_file_path=dump_file_path,
-            apply_mask=False,
+            dump_file_path=dump_file_path,
+            apply_mask=True,
             skip_if_mislabeled=False
         )
 
-        # Overlay the gradient map over the video
-        # after pooling both (video and its heatmap)
-        if rgb_video is not None and grayscale_video is not None:
-            rgb_video, grayscale_video = pool_cam(rgb_video, grayscale_video)
-            overlayed_video = []
+        # # Overlay the gradient map over the video
+        # # after pooling both (video and its heatmap)
+        # if rgb_video is not None and grayscale_video is not None:
+        #     rgb_video, grayscale_video = pool_cam(rgb_video, grayscale_video)
+        #     overlayed_video = []
 
-            for frame_idx in range(rgb_video.shape[0]):
-                overlayed_video.append(
-                    show_cam_on_image(rgb_video[frame_idx], grayscale_video[frame_idx], use_rgb=True)
-                )
+        #     for frame_idx in range(rgb_video.shape[0]):
+        #         overlayed_video.append(
+        #             show_cam_on_image(rgb_video[frame_idx], grayscale_video[frame_idx], use_rgb=True)
+        #         )
 
-            video_name = video_name.partition(".")[0]
-            root_file_path = Path(f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{language}/{generative_method}/{video_name}')
-            video_dump_path = Path(f'{root_file_path}/rgb_original_video.npy')
-            heatmap_dump_path = Path(f'{root_file_path}/heatmap_grayscale.npy')
-            overlayed_dump_path = Path(f'{root_file_path}/overlayed_video.npy')
+        #     # video_name = video_name.partition(".")[0]
+        #     root_file_path = Path(f'/mnt/d/projects/MAVOS-DD-GenClassifer/subset/{language}/{generative_method}/{video_name}')
+        #     os.makedirs(f"/mnt/d/projects/MAVOS-DD-GenClassifer/subset/{language}/{generative_method}/{video_name}", exist_ok=True)
+        #     # video_dump_path = Path(f'{root_file_path}/rgb_original_video.npy')
+        #     heatmap_dump_path = Path(f'{root_file_path}/heatmap_grayscale.npy')
+        #     # overlayed_dump_path = Path(f'{root_file_path}/overlayed_video.npy')
             
-            video_dump_path.parent.mkdir(exist_ok=True, parents=True)
+        #     # video_dump_path.parent.mkdir(exist_ok=True, parents=True)
 
-            print(f'Generating {root_file_path}...')
+        #     print(f'Generating {root_file_path}...')
 
-            np.save(video_dump_path, rgb_video)
-            np.save(heatmap_dump_path, grayscale_video)
-            np.save(overlayed_dump_path, np.stack(overlayed_video))
+        #     # np.save(video_dump_path, rgb_video)
+        #     np.save(heatmap_dump_path, grayscale_video)
+        #     # np.save(overlayed_dump_path, np.stack(overlayed_video))
 
-            # dump_cam_to_disk(np.stack(overlayed_video), dump_file_path, fps=1)
+        #     # dump_cam_to_disk(np.stack(overlayed_video), dump_file_path, fps=1)

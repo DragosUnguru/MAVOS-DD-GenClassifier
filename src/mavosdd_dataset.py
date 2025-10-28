@@ -39,12 +39,14 @@ class RandomColor:
 
 
 class MavosDD(Dataset):
-    def __init__(self, dataset, input_path, audio_conf, stage, num_frames=16):
+    def __init__(self, dataset, input_path, audio_conf, stage, num_frames=16, custom_file_path=False):
         self.num_frames = num_frames
         self.stage = stage
 
         self.dataset = dataset
         self.input_path = input_path
+
+        self.custom_file_path = custom_file_path
 
         print('Dataset has {:d} samples'.format(len(self.dataset)))
         self.num_samples = len(self.dataset)
@@ -173,6 +175,7 @@ class MavosDD(Dataset):
             # Read the frames using the calculated indices
             frames = [vr[i].asnumpy() for i in frame_indices]
         except:
+            print(f"Could not open {video_name}. Defaulting to zeros")
             frames = torch.zeros(self.num_frames, 3, 224, 224)
             
         return frames
@@ -197,18 +200,28 @@ class MavosDD(Dataset):
             frames = torch.zeros(self.num_frames, 3, 224, 224)
             
         return frames
-    
+
+    def _get_mp4_path(self, sample):
+        if self.custom_file_path:
+            language, method, video_name = sample["video_path"].split(os.path.sep)
+
+            return f"/mnt/d/projects/MAVOS-DD-GenClassifer/subset/{language}/{method}/{video_name}/masked_video.mp4"
+        else:
+            return os.path.join(self.input_path,sample["video_path"])
+
     def _augment_concat(self, index):
         sample = self.dataset[index]
-        video_name = os.path.join(self.input_path,sample["video_path"])
+        original_video_name = os.path.join(self.input_path,sample["video_path"])
+        video_name = self._get_mp4_path(sample)
         label = 0 if sample["label"] == "real" else 1
         
         index_1 = random.choice([i for i in range(len(self.dataset))])
         sample_1 = self.dataset[index_1]
-        video_name_1 = os.path.join(self.input_path,sample_1["video_path"])
+        original_video_name_1 = os.path.join(self.input_path,sample_1["video_path"])
+        video_name_1 = self._get_mp4_path(sample_1)
         label_1 = 0 if sample_1["label"] == "real" else 1
 
-        fbank = self._concat_wav2fbank(video_name, video_name_1)
+        fbank = self._concat_wav2fbank(original_video_name, original_video_name_1)
         frames = self._concat_get_frames(video_name, video_name_1)
 
         if self.stage == 1:
@@ -223,7 +236,8 @@ class MavosDD(Dataset):
 
     def _augment_replace(self, index):
         sample = self.dataset[index]
-        video_name = os.path.join(self.input_path,sample["video_path"])
+        original_video_name = os.path.join(self.input_path,sample["video_path"])
+        video_name = self._get_mp4_path(sample)
         label = 0 if sample["label"] == "real" else 1
         # if int(label) == 0:
         #     frames = self._get_frames(video_name)
@@ -233,12 +247,13 @@ class MavosDD(Dataset):
         label = 1
         index_1 = random.choice([i for i in range(len(self.dataset))])
         sample_1 = self.dataset[index_1]
-        video_name_1 = os.path.join(self.input_path,sample_1["video_path"])
+        original_video_name_1 = os.path.join(self.input_path,sample_1["video_path"])
+        video_name_1 = self._get_mp4_path(sample_1)
         label_1 = 0 if sample_1["label"] == "real" else 1
 
         # Replace audio with other
         frames = self._get_frames(video_name)
-        fbank = self._wav2fbank(video_name_1)
+        fbank = self._wav2fbank(original_video_name_1)
         return fbank, frames, label
 
     def __getitem__(self, index):
@@ -249,13 +264,14 @@ class MavosDD(Dataset):
         if show_time: print(f"Step 1: ", time.time() - start_time)
         if show_time: start_time = time.time()
         
-        video_name = os.path.join(self.input_path,sample["video_path"])
+        original_video_name = os.path.join(self.input_path,sample["video_path"])
+        video_name = self._get_mp4_path(sample)
         label = 0 if sample["label"] == "real" else 1
 
         # Do not perform data augment under eval mode
         if self.mode == 'eval':
             try:
-                fbank = self._wav2fbank(video_name)
+                fbank = self._wav2fbank(original_video_name)
             except:
                 fbank = torch.zeros([self.target_length, 128]) + 0.01
                 print('there is an error in loading audio')
@@ -276,7 +292,7 @@ class MavosDD(Dataset):
                 fbank, frames, label = self._augment_replace(index)
             else:
                 try:
-                    fbank = self._wav2fbank(video_name)
+                    fbank = self._wav2fbank(original_video_name)
                 except:
                     fbank = torch.zeros([self.target_length, 128]) + 0.01
                     print('there is an error in loading audio')

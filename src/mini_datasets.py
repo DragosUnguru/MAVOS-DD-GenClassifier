@@ -3,7 +3,7 @@ import datasets
 from torch.utils.data import DataLoader
 from mavosdd_dataset_multiclass import MavosDD
 from datasets import concatenate_datasets
-
+import os
 def get_mini_test_set(batch_size: int, audio_conf: object, num_workers: int = 4, shuffle: bool = False) -> DataLoader:
     input_path = '/mnt/d/projects/datasets/MAVOS-DD'
 
@@ -45,3 +45,49 @@ def get_mini_test_set(batch_size: int, audio_conf: object, num_workers: int = 4,
     )
 
     return dataloader
+
+def get_mini_train_set_deepfake_detection(input_path: str) -> DataLoader:
+
+    mavos_dd = datasets.Dataset.load_from_disk(input_path).filter(
+                    lambda sample: sample['split']=="train" and sample['open_set_model']==False and sample["open_set_language"]==False)
+
+    unique_gen_methods = list(set(mavos_dd['generative_method'])) + list(set(mavos_dd['audio_generative_method']))
+    unique_languages = list(set(mavos_dd['language']))
+    dict_count_gen_methods = {}
+    list_datasets = []
+    for language in unique_languages:
+        mavos_language = mavos_dd.filter(lambda sample: sample['language'] == language)
+        mavos_language = mavos_language.shuffle(seed=1234)
+        list_datasets.append(mavos_language.select(range(300)))
+    #     print(f"Language {language} size: {len(mavos_language)}")
+    #     for gen_method in unique_gen_methods:
+    #         mavos_gen_method = mavos_language.filter(lambda sample: sample['generative_method'] == gen_method or sample['audio_generative_method'] == gen_method)
+    #         print(f"Language {language} generative method {gen_method} size: {len(mavos_gen_method)}")
+    #         if gen_method not in dict_count_gen_methods:
+    #             dict_count_gen_methods[gen_method] = len(mavos_gen_method)
+    #         else:
+    #             dict_count_gen_methods[gen_method] += len(mavos_gen_method)
+    #     dict_count_gen_methods['real'] = len(mavos_language.filter(lambda sample: sample['label']=="real"))
+    # print(dict_count_gen_methods)
+    # exit()
+
+    # for audio_type in audio_labels:
+    #     mavos_dd_per_type = mavos_dd.filter(lambda sample: sample['audio_generative_method'] == audio_type)
+    #     list_datasets.append(mavos_dd_per_type.select(range(min(len(mavos_dd_per_type), 20))))
+    mavos_dd = concatenate_datasets(list_datasets)
+    mavos_dd.save_to_disk("subset")
+    return mavos_dd
+
+if __name__ == "__main__":
+    import shutil
+    input_path = "/mnt/d/projects/datasets/MAVOS-DD"
+    mavos = get_mini_train_set_deepfake_detection(input_path)
+    source_dir = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp"
+    destination_dir = "/mnt/d/projects/MAVOS-DD-GenClassifer/subset"
+    for sample in mavos:
+        if sample['label']=='fake':
+            video_path = sample['video_path']
+            source_video_path = os.path.join(source_dir, video_path[:-4], "heatmap_grayscale.npy")
+            destination_video_path = os.path.join(destination_dir, video_path[:-4], "heatmap_grayscale.npy")
+            os.makedirs(os.path.join(destination_dir, video_path[:-4]), exist_ok=True)
+            shutil.copy(source_video_path, destination_video_path)

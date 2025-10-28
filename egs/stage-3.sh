@@ -39,12 +39,13 @@ tr_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_train.csv
 te_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_validation.sv
 
 # exp_dir=./exp/self-pretrain
-save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3
+# save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3
+save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/binary_classification
 mkdir -p $save_dir
 mkdir -p ${save_dir}/models
 
 CUDA_CACHE_DISABLE=1 python -W ignore ../src/run_ft.py \
---data-train ${tr_data} --data-val ${te_data} --save-dir $save_dir --n_classes 10 \
+--data-train ${tr_data} --data-val ${te_data} --save-dir $save_dir --n_classes 2 \
 --lr $lr --n-epochs ${epoch} --batch-size $batch_size \
 --lrscheduler_start ${lrscheduler_start} --lrscheduler_decay ${lrscheduler_decay} --lrscheduler_step ${lrscheduler_step} \
 --dataset_mean ${dataset_mean} --dataset_std ${dataset_std} --target_length ${target_length} --noise ${noise} \
