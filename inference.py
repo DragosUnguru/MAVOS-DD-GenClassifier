@@ -7,40 +7,30 @@ import json
 from tqdm import tqdm
 import datasets
 
-from src.mavosdd_dataset_multiclass import MavosDD
+from src.mavosdd_dataset import MavosDD
 
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
-CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3"
-CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.6.pth"
-DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.6.PREDICTIONS.closed_set.json"
+CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/binary_classification"
+CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.10.pth"
+DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS.json"
 
-video_labels = {
-    "memo": 0,
-    "liveportrait": 1,
-    "inswapper": 2,
-    "echomimic": 3,
-}
-audio_labels = {
-    "knnvc": 4,
-    "freevc": 5,
-    "openvoice": 6,
-    "xtts_v2": 7,
-    "yourtts": 8,
-}
-class_name_to_label_mapping = { **video_labels, **audio_labels }
+# video_labels = {
+#     "memo": 0,
+#     "liveportrait": 1,
+#     "inswapper": 2,
+#     "echomimic": 3,
+# }
+# audio_labels = {
+#     "knnvc": 4,
+#     "freevc": 5,
+#     "openvoice": 6,
+#     "xtts_v2": 7,
+#     "yourtts": 8,
+# }
+# class_name_to_label_mapping = { **video_labels, **audio_labels }
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-
-# Load model
-cavmae_ft = VideoCAVMAEFT(n_classes=len(class_name_to_label_mapping))
-if not isinstance(cavmae_ft, torch.nn.DataParallel):
-    cavmae_ft = torch.nn.DataParallel(cavmae_ft)
-cavmae_ft.eval()
-
-ckpt = torch.load(CHECKPOINT_PATH, map_location=device)
-miss, unexp = cavmae_ft.load_state_dict(ckpt, strict=False)
-assert len(miss) == 0 and len(unexp) == 0 
 
 dataset_mean=-5.081
 dataset_std=4.4849
@@ -49,15 +39,22 @@ val_audio_conf = {'num_mel_bins': 128, 'target_length': target_length, 'freqm': 
                   'mode':'eval', 'mean': dataset_mean, 'std': dataset_std, 'noise': False, 'im_res': 224}
 
 if __name__ == "__main__":
+    # Load model
+    cavmae_ft = VideoCAVMAEFT(n_classes=2)
+    if not isinstance(cavmae_ft, torch.nn.DataParallel):
+        cavmae_ft = torch.nn.DataParallel(cavmae_ft)
+    cavmae_ft.eval()
     cavmae_ft.to(device)
+
+    ckpt = torch.load(CHECKPOINT_PATH, map_location=device)
+    miss, unexp = cavmae_ft.load_state_dict(ckpt, strict=False)
+    assert len(miss) == 0 and len(unexp) == 0
 
     mavos_dd = datasets.Dataset.load_from_disk(DATASET_INPUT_PATH)
 
     val_loader = torch.utils.data.DataLoader(
-        MavosDD(mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==False and sample["open_set_language"]==False
-                and (sample['generative_method'] != 'real' or sample['audio_generative_method'] != 'real')),
-                DATASET_INPUT_PATH, val_audio_conf, stage=2, video_class_name_to_idx=video_labels, audio_class_name_to_idx=audio_labels),
-        batch_size=32, shuffle=False, num_workers=2, pin_memory=False
+        MavosDD(mavos_dd.filter(lambda sample: sample['split']=="test"), DATASET_INPUT_PATH, val_audio_conf, stage=2, custom_file_path=False),
+        batch_size=32, shuffle=False, num_workers=0, pin_memory=False
     )
 
     A_predictions, A_targets = [], []
