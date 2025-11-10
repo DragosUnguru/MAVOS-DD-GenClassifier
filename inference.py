@@ -11,7 +11,7 @@ from src.mavosdd_dataset import MavosDD
 
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
-CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/binary_classification"
+CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/binary_classification_05"
 CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.10.pth"
 DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS.json"
 

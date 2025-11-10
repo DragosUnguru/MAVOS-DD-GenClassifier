@@ -234,7 +234,7 @@ def gradcam_show(
 
             if apply_mask:
                 all_visualizations.append(
-                    apply_cam_mask(rgb_img=rgb_img_collection[temporal_idx], grayscale_cam=grayscale_cam, mode="hard", threshold=0.4)
+                    apply_cam_mask(rgb_img=rgb_img_collection[temporal_idx], grayscale_cam=grayscale_cam, mode="hard", threshold=0.5)
                 )
             else:
                 all_visualizations.append(
@@ -342,7 +342,7 @@ if __name__ == '__main__':
         (language, generative_method, video_name) = unbatched_video_path.split(os.path.sep)
         
         # dump_file_path = Path(f'/mnt/d/projects/MAVOS-DD-GenClassifer/exp/{language}/{generative_method}/POOLED_{video_name}')
-        dump_file_path = Path(f'/mnt/d/projects/MAVOS-DD-GenClassifer/subset/{language}/{generative_method}/{video_name}/masked_video.mp4')
+        dump_file_path = Path(f'/mnt/d/projects/MAVOS-DD-GenClassifer/subset/{language}/{generative_method}/{video_name}/masked_video_05.mp4')
         dump_file_path.parent.mkdir(exist_ok=True, parents=True)
 
         print(f'Generating {dump_file_path}...')

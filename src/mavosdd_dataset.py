@@ -205,7 +205,7 @@ class MavosDD(Dataset):
         if self.custom_file_path:
             language, method, video_name = sample["video_path"].split(os.path.sep)
 
-            return f"/mnt/d/projects/MAVOS-DD-GenClassifer/subset/{language}/{method}/{video_name}/masked_video.mp4"
+            return f"/mnt/d/projects/MAVOS-DD-GenClassifer/subset/{language}/{method}/{video_name}/masked_video_05.mp4"
         else:
             return os.path.join(self.input_path,sample["video_path"])
 

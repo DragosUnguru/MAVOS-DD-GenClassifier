@@ -9,6 +9,23 @@ import numpy as np
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
+
+def forward_loss_mask(model, masking_output):
+        """
+        imgs: [N, 3, H, W]
+        pred: [N, L, p*p*3]
+        mask: [N, L], 0 is keep, 1 is remove,
+        """
+        ## Gaussian loss: converges the output towards 0s and 1s
+        loss_gauss = model.lambda_gauss * (torch.exp(model.alpha*(masking_output - 0.5)**2) / model.beta).mean()
+        ## KL Divergence loss ensure the fixed masking ratio
+        loss_kl = model.lambda_kl * (model.kl_divergence(masking_output.mean(-1), 0.25) + model.kl_divergence((1-masking_output).mean(-1), 0.75))
+        ## Diversity loss to prevent converging module to generate fixed set of mask for different samples
+        loss_diversity = model.lambda_diversity * model.diversity_loss(masking_output)
+
+        return loss_gauss, loss_kl, loss_diversity
+
+
 def train(model, train_loader, test_loader, args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.set_grad_enabled(True)
@@ -100,12 +117,17 @@ def train(model, train_loader, test_loader, args):
             # print(f"step 2: ", time.time() - start_time)
             # start_time = time.time()
             with autocast():
-                output = model(a_input, v_input)
-                # print(f"step 3: ", time.time() - start_time)
-                # start_time = time.time()
-                loss = loss_fn(output, labels)
-                # print(f"step 4: ", time.time() - start_time)
-                # start_time = time.time()
+                if args.train_mask:
+                    output, video_mask, ids_restore = model(a_input, v_input, train_mask=args.train_mask, mask_ratio=args.mask_ratio)
+
+                    loss = loss_fn(output, labels) + args.mask_loss_lambda * sum(forward_loss_mask(model.module, video_mask))
+                else:
+                    output, _, _ = model(a_input, v_input, train_mask=args.train_mask, mask_ratio=args.mask_ratio)
+                    # print(f"step 3: ", time.time() - start_time)
+                    # start_time = time.time()
+                    loss = loss_fn(output, labels)
+                    # print(f"step 4: ", time.time() - start_time)
+                    # start_time = time.time()
             
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -220,7 +242,7 @@ def validate(model, val_loader, args, output_pred=False):
             labels = labels.to(device)
 
             with autocast():
-                audio_output = model(a_input, v_input)
+                audio_output, _, _ = model(a_input, v_input, train_mask=args.train_mask, mask_ratio=args.mask_ratio)
 
             predictions = audio_output.to('cpu').detach()
 

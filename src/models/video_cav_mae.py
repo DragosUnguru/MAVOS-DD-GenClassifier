@@ -1,8 +1,10 @@
+import math
 import torch
 import torch.nn as nn
 from .audio_modules import AudioEncoder, AudioDecoder
 from .visual_modules import VisualEncoder, VisualDecoder
 from .fusion_modules import A2VNetwork, V2ANetwork
+from .masking_module.masking_modules import MaskingNet
 import random
 from einops import rearrange
 
@@ -267,6 +269,32 @@ class VideoCAVMAE(nn.Module):
         
         return total_loss, nce_loss, c_acc, rec_loss_a, rec_loss_v, audio_recon, video_recon
     
+
+class DiversityLoss(nn.Module):
+    def __init__(self, distance_metric='euclidean', scale_factor=0.1):
+        super(DiversityLoss, self).__init__()
+        self.distance_metric = distance_metric
+        self.scale_factor = scale_factor
+
+    def forward(self, outputs):
+        n = outputs.size()[0]  # size of batch
+        if n == 1:
+            return 0.0
+        # compute distance matrix between outputs
+        if self.distance_metric == 'euclidean':
+            distances = torch.cdist(outputs, outputs, p=2)
+        else:
+            raise ValueError('Unsupported distance metric')
+        # compute diversity loss
+        loss = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                loss += torch.exp(-distances[i, j] * self.scale_factor)
+        # normalize loss by batch size
+        loss /= n * (n - 1) / 2
+        return loss
+
+
 class VideoCAVMAEFT(nn.Module):
     def __init__(self, 
         n_classes=2,
@@ -287,6 +315,9 @@ class VideoCAVMAEFT(nn.Module):
         init_values=0.,
         tubelet_size=2,
         norm_pix_loss=True,
+        lambda_gauss=1.0,
+        lambda_kl=0.01,
+        lambda_diversity = 2.0
     ):
         super().__init__()
         
@@ -295,7 +326,24 @@ class VideoCAVMAEFT(nn.Module):
         self.patch_size = patch_size
         self.norm_pix_loss = norm_pix_loss
         self.n_frames = n_frames
-        
+
+        # MAE masking net specifics
+        self.alpha = -1 / (0.12 * 0.12 * 2)
+        self.beta = 1 / (0.12 * math.sqrt(2 * math.pi))
+        self.diversity_loss = DiversityLoss()
+
+        self.lambda_gauss = lambda_gauss
+        self.lambda_kl = lambda_kl
+        self.lambda_diversity = lambda_diversity
+
+        self.masking_net = MaskingNet(
+            num_tokens=196 * self.n_frames // 2,
+            embed_dim=encoder_embed_dim,
+            depth=encoder_depth,
+            num_heads=encoder_num_heads,
+            mlp_ratio=mlp_ratio
+            # norm_layer=nn.LayerNorm
+        )
         self.audio_encoder = AudioEncoder(
             audio_length=audio_length,
             mel_bins=mel_bins,
@@ -341,7 +389,12 @@ class VideoCAVMAEFT(nn.Module):
         self.mlp_vision = torch.nn.Linear(1568, hidden_dim)
         self.mlp_audio = torch.nn.Linear(512, hidden_dim)
         self.mlp_head = MLP(input_size=hidden_dim * 2, hidden_size=hidden_dim, num_classes=n_classes)
-    
+
+    def kl_divergence(self, p, q):
+        p = torch.as_tensor(p, dtype=torch.float32)
+        q = torch.as_tensor(q, dtype=torch.float32)
+        return torch.sum(p * torch.log(p / q), dim=-1)
+
     def patchify(self, imgs, c, h, w, p=16):
         """
         imgs: (N, 3, H, W)
@@ -363,24 +416,61 @@ class VideoCAVMAEFT(nn.Module):
         x = torch.einsum('nhwpqc->nchpwq', x)
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
-    
-    def forward(self, audio, video):
+
+    def apply_masking(self, x, mask_ratio=0.75):
+        """
+        x: (B, T, C) visual token embeddings (i.e. from VisualEncoder)
+        Returns:
+            x_masked: masked embeddings
+            mask: binary mask (1 = masked, 0 = kept)
+            loss_gauss, loss_kl, loss_div: mask regularization losses
+        """
+        B, T, _ = x.shape # batch, length, dim
+        len_keep = int(T * (1 - mask_ratio))
+
+        # Predict soft mask scores from MaskingNet
+        mask_embedding = self.masking_net(x)  # (B, L): sigmoid [0, 1]
+
+        # Compute hard binary mask by top-k thresholding
+        ids_shuffle = torch.argsort(mask_embedding, dim=1, descending=True) # descend: small is remove, large is keep
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        ids_keep = ids_shuffle[:, :len_keep]
+
+        # Binary mask (1 = drop, 0 = keep)
+        mask = torch.ones([B, T], device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        # Apply mask (hard masking)
+        x_masked = x.clone()
+        x_masked[mask.bool()] = 0.0  # zero out masked tokens
+
+        return x_masked, mask, ids_restore
+
+
+    def forward(self, audio, video, mask_ratio=0.75, train_mask=False):
         # audio: (B, 1024, 128)
         # video: (B, 3, 16, 224, 224)
         
         # Forward audio and video through their respective encoders
         audio_emb = self.audio_encoder(audio)
         video_emb = self.visual_encoder(video)
-        
+        video_mask = None
+        ids_restore = None
+
+        # Apply learned masking on visual embeddings
+        if train_mask:
+            video_emb, video_mask, ids_restore = self.apply_masking(video_emb, mask_ratio)
+
         # Rearrange audio and video embeddings to perform temporal complementary mask
         b, t, c = audio_emb.shape
         audio_emb = audio_emb.reshape(b, self.n_frames // 2, -1, c)
         b, t, c = video_emb.shape
         video_emb = video_emb.reshape(b, self.n_frames // 2, -1, c)
-        
+
         video_fusion = self.a2v(audio_emb)
         audio_fusion = self.v2a(video_emb)
-        
+
         # Concat along feature dimension
         video_fusion = torch.concat((video_fusion, video_emb), dim=-1)
         audio_fusion = torch.concat((audio_fusion, audio_emb), dim=-1)
@@ -395,4 +485,4 @@ class VideoCAVMAEFT(nn.Module):
         
         output = self.mlp_head(torch.concat((video_fusion, audio_fusion), dim=-1))
         
-        return output
+        return output, video_mask, ids_restore

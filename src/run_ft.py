@@ -29,7 +29,7 @@ parser.add_argument("--metrics", type=str, default="mAP", help="the main evaluat
 parser.add_argument("--loss", type=str, default="BCE", help="the loss function for finetuning, depend on the task", choices=["BCE", "CE"])
 parser.add_argument('--n-epochs', default=10, type=int, help='number of epochs')
 parser.add_argument('--n_classes', default=2, type=int, help='Num of classes to be classified')
-parser.add_argument('--save-dir', default='checkpoints/binary_classification', type=str, help='directory to save checkpoints')
+parser.add_argument('--save-dir', default='checkpoints/trainable_mask_binary_classification', type=str, help='directory to save checkpoints')
 parser.add_argument('--pretrain_path', default='/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/stage-3.pth', type=str, help='path to pretrain model')
 parser.add_argument("--contrast_loss_weight", type=float, default=0.01, help="weight for contrastive loss")
 parser.add_argument("--mae_loss_weight", type=float, default=3.0, help="weight for mae loss")
@@ -44,6 +44,9 @@ parser.add_argument('--freqm', help='frequency mask max length', type=int, defau
 parser.add_argument('--timem', help='time mask max length', type=int, default=0)
 parser.add_argument('--warmup',type=bool, default=True)
 parser.add_argument('--head_lr', type=int, default=50)
+parser.add_argument('--mask_loss_lambda', type=float, default=0.1)
+parser.add_argument('--train_mask', type=bool, default=True)
+parser.add_argument('--mask_ratio', type=float, default=0.75)
 
 parser.add_argument("--wa_start", type=int, default=1, help="which epoch to start weight averaging in finetuning")
 parser.add_argument("--wa_end", type=int, default=10, help="which epoch to end weight averaging in finetuning")
@@ -96,7 +99,7 @@ train_loader = DataLoader(
         # video_class_name_to_idx=video_labels,
         # audio_class_name_to_idx=audio_labels,
         stage=2,
-        custom_file_path=True),
+        custom_file_path=False),
     batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=False
 )
 val_loader = DataLoader(
