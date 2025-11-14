@@ -417,7 +417,7 @@ class VideoCAVMAEFT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
 
-    def apply_masking(self, x, mask_ratio=0.75):
+    def apply_masking(self, x, hard_mask, mask_ratio):
         """
         x: (B, T, C) visual token embeddings (i.e. from VisualEncoder)
         Returns:
@@ -425,33 +425,42 @@ class VideoCAVMAEFT(nn.Module):
             mask: binary mask (1 = masked, 0 = kept)
             loss_gauss, loss_kl, loss_div: mask regularization losses
         """
+        # Train in 2 separate phases:
+        #   - AVFF frozen & train module with soft masking
+        #   - AVFF unfrozen & train with hard masking module
+
         B, T, _ = x.shape # batch, length, dim
         len_keep = int(T * (1 - mask_ratio))
 
         # Predict soft mask scores from MaskingNet
         mask_embedding = self.masking_net(x)  # (B, L): sigmoid [0, 1]
 
-        # Compute hard binary mask by top-k thresholding
-        ids_shuffle = torch.argsort(mask_embedding, dim=1, descending=True) # descend: small is remove, large is keep
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-        ids_keep = ids_shuffle[:, :len_keep]
+        if not hard_mask:
+            x_masked = x * (1 - mask_embedding.unsqueeze(-1))
 
-        # Binary mask (1 = drop, 0 = keep)
-        mask = torch.ones([B, T], device=x.device)
-        mask[:, :len_keep] = 0
-        mask = torch.gather(mask, dim=1, index=ids_restore)
+            return x_masked, mask_embedding, None
+        else:
+            # Compute hard binary mask by top-k thresholding
+            ids_shuffle = torch.argsort(mask_embedding, dim=1, descending=True) # descend: small is remove, large is keep
+            ids_restore = torch.argsort(ids_shuffle, dim=1)
+            ids_keep = ids_shuffle[:, :len_keep]
 
-        # Apply mask (hard masking)
-        x_masked = x.clone()
-        x_masked[mask.bool()] = 0.0  # zero out masked tokens
+            # Binary mask (1 = drop, 0 = keep)
+            mask = torch.ones([B, T], device=x.device)
+            mask[:, :len_keep] = 0
+            mask = torch.gather(mask, dim=1, index=ids_restore)
 
-        return x_masked, mask, ids_restore
+            # Apply mask (hard masking)
+            x_masked = x.clone()
+            x_masked[mask.bool()] = 0.0  # zero out masked tokens
+
+            return x_masked, mask, ids_restore
 
 
-    def forward(self, audio, video, mask_ratio=0.75, train_mask=False):
+    def forward(self, audio, video, apply_mask=False, hard_mask=False, hard_mask_ratio=0.75):
         # audio: (B, 1024, 128)
         # video: (B, 3, 16, 224, 224)
-        
+
         # Forward audio and video through their respective encoders
         audio_emb = self.audio_encoder(audio)
         video_emb = self.visual_encoder(video)
@@ -459,8 +468,8 @@ class VideoCAVMAEFT(nn.Module):
         ids_restore = None
 
         # Apply learned masking on visual embeddings
-        if train_mask:
-            video_emb, video_mask, ids_restore = self.apply_masking(video_emb, mask_ratio)
+        if apply_mask:
+            video_emb, video_mask, ids_restore = self.apply_masking(video_emb, hard_mask, hard_mask_ratio)
 
         # Rearrange audio and video embeddings to perform temporal complementary mask
         b, t, c = audio_emb.shape
@@ -486,3 +495,34 @@ class VideoCAVMAEFT(nn.Module):
         output = self.mlp_head(torch.concat((video_fusion, audio_fusion), dim=-1))
         
         return output, video_mask, ids_restore
+
+
+    def freeze_maskingnet(self):
+        for name, param in self.named_parameters():
+            if "masking_net" in name:
+                param.requires_grad = False
+
+
+    def unfreeze_maskingnet(self):
+        for name, param in self.named_parameters():
+            if "masking_net" in name:
+                param.requires_grad = True
+
+
+    def freeze_backbone(self):
+        for name, param in self.named_parameters():
+            if "masking_net" in name:
+                continue
+            if "pos_embed" in name:
+                continue
+
+            param.requires_grad = False
+
+
+    def unfreeze_backbone(self):
+        for name, param in self.named_parameters():
+            if "masking_net" in name:
+                continue
+            if "pos_embed" in name:
+                continue
+            param.requires_grad = True

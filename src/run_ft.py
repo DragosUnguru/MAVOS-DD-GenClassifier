@@ -44,9 +44,9 @@ parser.add_argument('--freqm', help='frequency mask max length', type=int, defau
 parser.add_argument('--timem', help='time mask max length', type=int, default=0)
 parser.add_argument('--warmup',type=bool, default=True)
 parser.add_argument('--head_lr', type=int, default=50)
-parser.add_argument('--mask_loss_lambda', type=float, default=0.1)
-parser.add_argument('--train_mask', type=bool, default=True)
-parser.add_argument('--mask_ratio', type=float, default=0.75)
+parser.add_argument('--mask_loss_lambda', type=float, default=0.15)
+parser.add_argument('--train_mask', type=bool, default=False)
+parser.add_argument('--mask_ratio', type=float, default=0.4)
 
 parser.add_argument("--wa_start", type=int, default=1, help="which epoch to start weight averaging in finetuning")
 parser.add_argument("--wa_end", type=int, default=10, help="which epoch to end weight averaging in finetuning")

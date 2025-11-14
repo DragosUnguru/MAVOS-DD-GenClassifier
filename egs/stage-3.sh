@@ -16,7 +16,7 @@ mae_loss_weight=1.0
 norm_pix_loss=True
 
 # you can use any checkpoints with a decoder, but by default, we use vision-MAE checkpoint
-pretrain_path=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/stage-3.pth
+pretrain_path=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/trainable_mask_binary_classification_2-STAGE-TRAINING/01-avff-frozen-mask-trainable/models/audio_model.10.pth
 
 lr=1e-5
 head_lr=50
@@ -40,7 +40,7 @@ te_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_validation.sv
 
 # exp_dir=./exp/self-pretrain
 # save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3
-save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/trainable_mask_binary_classification_COTRAINING
+save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/trainable_mask_binary_classification_2-STAGE-TRAINING/02-avff-trainable-mask-frozen
 mkdir -p $save_dir
 mkdir -p ${save_dir}/models
 
@@ -55,4 +55,5 @@ CUDA_CACHE_DISABLE=1 python -W ignore ../src/run_ft.py \
 --loss BCE --metrics mAP --warmup True \
 --wa_start ${wa_start} --wa_end ${wa_end} --lr_adapt ${lr_adapt} \
 --head_lr ${head_lr} \
---pretrain_path ${pretrain_path} --num_workers 2\
+--pretrain_path ${pretrain_path} --num_workers 2 \
+--mask_loss_lambda 0.0 --mask_ratio 0.4 #--train_mask

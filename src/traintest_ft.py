@@ -42,6 +42,17 @@ def train(model, train_loader, test_loader, args):
         model = torch.nn.DataParallel(model)
     
     model.to(device)
+
+    if args.train_mask:
+        print("Training MaskingNet. I.e. freezing AVFF and using soft mask")
+
+        model.module.freeze_backbone()
+        hard_mask = False
+    else:
+        print("Training AVFF. I.e. freezing MaskingNet and using hard mask")
+
+        model.module.freeze_maskingnet()
+        hard_mask = True
     
     # possible mlp layer name list, mlp layers are newly initialized layers in the finetuning stage (i.e., not pretrained) and should use a larger lr during finetuning
     mlp_list = [
@@ -109,7 +120,7 @@ def train(model, train_loader, test_loader, args):
             a_input = a_input.to(device, non_blocking=True)
             v_input = v_input.to(device, non_blocking=True)
             labels = labels.to(device)
-            
+
             data_time.update(time.time() - end_time)
             per_sample_data_time.update((time.time() - end_time) / B)
             dnn_start_time = time.time()
@@ -117,18 +128,9 @@ def train(model, train_loader, test_loader, args):
             # print(f"step 2: ", time.time() - start_time)
             # start_time = time.time()
             with autocast():
-                if args.train_mask:
-                    output, video_mask, ids_restore = model(a_input, v_input, train_mask=args.train_mask, mask_ratio=args.mask_ratio)
+                output, video_mask, _ = model(a_input, v_input, apply_mask=True, hard_mask=hard_mask, hard_mask_ratio=args.mask_ratio)
+                loss = loss_fn(output, labels) + args.mask_loss_lambda * sum(forward_loss_mask(model.module, video_mask))
 
-                    loss = loss_fn(output, labels) + args.mask_loss_lambda * sum(forward_loss_mask(model.module, video_mask))
-                else:
-                    output, _, _ = model(a_input, v_input, train_mask=args.train_mask, mask_ratio=args.mask_ratio)
-                    # print(f"step 3: ", time.time() - start_time)
-                    # start_time = time.time()
-                    loss = loss_fn(output, labels)
-                    # print(f"step 4: ", time.time() - start_time)
-                    # start_time = time.time()
-            
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -242,7 +244,7 @@ def validate(model, val_loader, args, output_pred=False):
             labels = labels.to(device)
 
             with autocast():
-                audio_output, _, _ = model(a_input, v_input, train_mask=args.train_mask, mask_ratio=args.mask_ratio)
+                audio_output, _, _ = model(a_input, v_input, apply_mask=False)
 
             predictions = audio_output.to('cpu').detach()
 
