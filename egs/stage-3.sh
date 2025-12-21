@@ -16,7 +16,7 @@ mae_loss_weight=1.0
 norm_pix_loss=True
 
 # you can use any checkpoints with a decoder, but by default, we use vision-MAE checkpoint
-pretrain_path=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/trainable_mask_binary_classification_2-STAGE-TRAINING/01-avff-frozen-mask-trainable/models/audio_model.10.pth
+pretrain_path=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/avff_mavos.pth
 
 lr=1e-5
 head_lr=50
@@ -30,7 +30,7 @@ dataset_mean=-5.081
 dataset_std=4.4849
 target_length=1024
 noise=True
-batch_size=16
+batch_size=32
 lr_adapt=False
 
 n_print_steps=100
@@ -40,11 +40,25 @@ te_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_validation.sv
 
 # exp_dir=./exp/self-pretrain
 # save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3
-save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/trainable_mask_binary_classification_2-STAGE-TRAINING/02-avff-trainable-mask-frozen
+save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_MINISET
 mkdir -p $save_dir
 mkdir -p ${save_dir}/models
 
-CUDA_CACHE_DISABLE=1 python -W ignore ../src/run_ft.py \
+# CUDA_CACHE_DISABLE=1 python -W ignore ../src/run_ft.py \
+# --data-train ${tr_data} --data-val ${te_data} --save-dir $save_dir --n_classes 2 \
+# --lr $lr --n-epochs ${epoch} --batch-size $batch_size \
+# --lrscheduler_start ${lrscheduler_start} --lrscheduler_decay ${lrscheduler_decay} --lrscheduler_step ${lrscheduler_step} \
+# --dataset_mean ${dataset_mean} --dataset_std ${dataset_std} --target_length ${target_length} --noise ${noise} \
+# --lr_adapt ${lr_adapt} \
+# --norm_pix_loss ${norm_pix_loss} \
+# --mae_loss_weight ${mae_loss_weight} --contrast_loss_weight ${contrast_loss_weight} \
+# --loss BCE --metrics mAP --warmup True \
+# --wa_start ${wa_start} --wa_end ${wa_end} --lr_adapt ${lr_adapt} \
+# --head_lr ${head_lr} \
+# --pretrain_path ${pretrain_path} --num_workers 2 \
+# --mask_loss_lambda 0.0 --mask_ratio 0.4 #--train_mask
+
+CUDA_CACHE_DISABLE=1 python -W ignore ../src/run_ft_adversarial.py \
 --data-train ${tr_data} --data-val ${te_data} --save-dir $save_dir --n_classes 2 \
 --lr $lr --n-epochs ${epoch} --batch-size $batch_size \
 --lrscheduler_start ${lrscheduler_start} --lrscheduler_decay ${lrscheduler_decay} --lrscheduler_step ${lrscheduler_step} \
@@ -56,4 +70,4 @@ CUDA_CACHE_DISABLE=1 python -W ignore ../src/run_ft.py \
 --wa_start ${wa_start} --wa_end ${wa_end} --lr_adapt ${lr_adapt} \
 --head_lr ${head_lr} \
 --pretrain_path ${pretrain_path} --num_workers 2 \
---mask_loss_lambda 0.0 --mask_ratio 0.4 #--train_mask
+--lambda_adv 1.0 --gen_loss_weight 1.0 --mask_loss_lambda 0.2 --mask_ratio 0.4 --miniset True

@@ -295,9 +295,38 @@ class DiversityLoss(nn.Module):
         return loss
 
 
+class GradientReversal(torch.autograd.Function):
+    """Gradient Reversal Layer for adversarial training.
+    
+    During forward pass: identity function
+    During backward pass: negates the gradients (multiplied by -lambda)
+    """
+    @staticmethod
+    def forward(ctx, x, lambda_val):
+        ctx.lambda_val = lambda_val
+        return x.clone()
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambda_val * grad_output, None
+
+
+class GradientReversalLayer(nn.Module):
+    def __init__(self, lambda_val=1.0):
+        super().__init__()
+        self.lambda_val = lambda_val
+    
+    def forward(self, x):
+        return GradientReversal.apply(x, self.lambda_val)
+    
+    def set_lambda(self, lambda_val):
+        self.lambda_val = lambda_val
+
+
 class VideoCAVMAEFT(nn.Module):
     def __init__(self, 
         n_classes=2,
+        n_gen_classes=9,  # Number of generative method classes (4 video + 5 audio)
         img_size=224,
         patch_size=16, 
         n_frames=16, 
@@ -317,7 +346,8 @@ class VideoCAVMAEFT(nn.Module):
         norm_pix_loss=True,
         lambda_gauss=1.0,
         lambda_kl=0.01,
-        lambda_diversity = 2.0
+        lambda_diversity=2.0,
+        lambda_adv=1.0,  # Adversarial loss weight
     ):
         super().__init__()
         
@@ -326,6 +356,7 @@ class VideoCAVMAEFT(nn.Module):
         self.patch_size = patch_size
         self.norm_pix_loss = norm_pix_loss
         self.n_frames = n_frames
+        self.n_gen_classes = n_gen_classes
 
         # MAE masking net specifics
         self.alpha = -1 / (0.12 * 0.12 * 2)
@@ -335,6 +366,7 @@ class VideoCAVMAEFT(nn.Module):
         self.lambda_gauss = lambda_gauss
         self.lambda_kl = lambda_kl
         self.lambda_diversity = lambda_diversity
+        self.lambda_adv = lambda_adv
 
         self.masking_net = MaskingNet(
             num_tokens=196 * self.n_frames // 2,
@@ -389,6 +421,16 @@ class VideoCAVMAEFT(nn.Module):
         self.mlp_vision = torch.nn.Linear(1568, hidden_dim)
         self.mlp_audio = torch.nn.Linear(512, hidden_dim)
         self.mlp_head = MLP(input_size=hidden_dim * 2, hidden_size=hidden_dim, num_classes=n_classes)
+        
+        # Adversarial head for generative method classification
+        # Uses gradient reversal layer to create adversarial training signal for masking net
+        self.gradient_reversal = GradientReversalLayer(lambda_val=lambda_adv)
+        self.gen_classifier = MLP(
+            input_size=hidden_dim * 2, 
+            hidden_size=hidden_dim, 
+            num_classes=n_gen_classes,
+            drop_rate=[0.5, 0.5]
+        )
 
     def kl_divergence(self, p, q):
         p = torch.as_tensor(p, dtype=torch.float32)
@@ -457,7 +499,7 @@ class VideoCAVMAEFT(nn.Module):
             return x_masked, mask, ids_restore
 
 
-    def forward(self, audio, video, apply_mask=False, hard_mask=False, hard_mask_ratio=0.75):
+    def forward(self, audio, video, apply_mask=False, hard_mask=False, hard_mask_ratio=0.75, adversarial=False):
         # audio: (B, 1024, 128)
         # video: (B, 3, 16, 224, 224)
 
@@ -492,9 +534,26 @@ class VideoCAVMAEFT(nn.Module):
         video_fusion = self.mlp_vision(video_fusion)
         audio_fusion = self.mlp_audio(audio_fusion)
         
-        output = self.mlp_head(torch.concat((video_fusion, audio_fusion), dim=-1))
+        fused_features = torch.concat((video_fusion, audio_fusion), dim=-1)
         
-        return output, video_mask, ids_restore
+        # Main classification head (real/fake detection)
+        output = self.mlp_head(fused_features)
+        
+        # Adversarial head for generative method classification
+        # The gradient reversal layer reverses gradients during backprop,
+        # so masking_net learns to HIDE generative method information
+        gen_output = None
+        if adversarial:
+            # Apply gradient reversal before gen_classifier
+            # This makes masking_net try to minimize gen classification accuracy
+            reversed_features = self.gradient_reversal(fused_features)
+            gen_output = self.gen_classifier(reversed_features)
+        
+        return output, gen_output, video_mask, ids_restore
+    
+    def set_adversarial_lambda(self, lambda_val):
+        """Set the gradient reversal strength for adversarial training."""
+        self.gradient_reversal.set_lambda(lambda_val)
 
 
     def freeze_maskingnet(self):
@@ -510,19 +569,37 @@ class VideoCAVMAEFT(nn.Module):
 
 
     def freeze_backbone(self):
+        """Freeze everything except masking_net, gen_classifier, and pos_embed."""
         for name, param in self.named_parameters():
             if "masking_net" in name:
                 continue
             if "pos_embed" in name:
+                continue
+            if "gen_classifier" in name:
                 continue
 
             param.requires_grad = False
 
 
     def unfreeze_backbone(self):
+        """Unfreeze everything except masking_net and pos_embed."""
         for name, param in self.named_parameters():
             if "masking_net" in name:
                 continue
             if "pos_embed" in name:
                 continue
             param.requires_grad = True
+
+
+    def freeze_gen_classifier(self):
+        """Freeze the generative method classifier head."""
+        for name, param in self.named_parameters():
+            if "gen_classifier" in name:
+                param.requires_grad = False
+
+
+    def unfreeze_gen_classifier(self):
+        """Unfreeze the generative method classifier head."""
+        for name, param in self.named_parameters():
+            if "gen_classifier" in name:
+                param.requires_grad = True

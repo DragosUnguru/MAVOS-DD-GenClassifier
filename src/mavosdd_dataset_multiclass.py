@@ -415,17 +415,22 @@ class MavosDD(Dataset):
         # frames: (T, C, H, W) -> (C, T, H, W)
         frames = frames.permute(1, 0, 2, 3)
 
-        # TODO: Two separate layers w/ two separate losses??
-        # video_label = torch.tensor(video_label, dtype=torch.long)  # for CrossEntropyLoss
-        # audio_label = torch.tensor(audio_label, dtype=torch.float) # for BCEWithLogitsLoss
+        # Main binary label for real/fake classification
+        # Real samples have video_class_name and audio_class_name both as "real"
+        is_fake = video_class_name != "real" or audio_class_name != "real"
+        main_label = torch.tensor([float(is_fake), float(not is_fake)], dtype=torch.float)
 
-        label = torch.zeros(self.num_classes, dtype=torch.float)
-        if video_class_name in self.video_class_name_to_idx:
-            label[self.video_class_name_to_idx[video_class_name]] = 1.0
-        if audio_class_name in self.audio_class_name_to_idx:
-            label[self.audio_class_name_to_idx[audio_class_name]] = 1.0
+        # Generative method label (multi-label for adversarial training)
+        # This is a 9-class multi-label vector (4 video + 5 audio methods)
+        gen_label = torch.zeros(self.num_classes, dtype=torch.float)
 
-        return fbank, frames, label, sample["video_path"]
+        assert video_class_name in self.video_class_name_to_idx, f"Video generative method '{video_class_name}' not found in class mapping."
+        gen_label[self.video_class_name_to_idx[video_class_name]] = 1.0
+
+        assert audio_class_name in self.audio_class_name_to_idx, f"Audio generative method '{audio_class_name}' not found in class mapping."
+        gen_label[self.audio_class_name_to_idx[audio_class_name]] = 1.0
+
+        return fbank, frames, main_label, gen_label, sample["video_path"]
 
     def __len__(self):
         return self.num_samples
