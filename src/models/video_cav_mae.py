@@ -295,34 +295,6 @@ class DiversityLoss(nn.Module):
         return loss
 
 
-class GradientReversal(torch.autograd.Function):
-    """Gradient Reversal Layer for adversarial training.
-    
-    During forward pass: identity function
-    During backward pass: negates the gradients (multiplied by -lambda)
-    """
-    @staticmethod
-    def forward(ctx, x, lambda_val):
-        ctx.lambda_val = lambda_val
-        return x.clone()
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        return -ctx.lambda_val * grad_output, None
-
-
-class GradientReversalLayer(nn.Module):
-    def __init__(self, lambda_val=1.0):
-        super().__init__()
-        self.lambda_val = lambda_val
-    
-    def forward(self, x):
-        return GradientReversal.apply(x, self.lambda_val)
-    
-    def set_lambda(self, lambda_val):
-        self.lambda_val = lambda_val
-
-
 class VideoCAVMAEFT(nn.Module):
     def __init__(self, 
         n_classes=2,
@@ -423,8 +395,6 @@ class VideoCAVMAEFT(nn.Module):
         self.mlp_head = MLP(input_size=hidden_dim * 2, hidden_size=hidden_dim, num_classes=n_classes)
         
         # Adversarial head for generative method classification
-        # Uses gradient reversal layer to create adversarial training signal for masking net
-        self.gradient_reversal = GradientReversalLayer(lambda_val=lambda_adv)
         self.gen_classifier = MLP(
             input_size=hidden_dim * 2, 
             hidden_size=hidden_dim, 
