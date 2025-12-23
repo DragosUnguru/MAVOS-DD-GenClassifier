@@ -30,7 +30,7 @@ dataset_mean=-5.081
 dataset_std=4.4849
 target_length=1024
 noise=True
-batch_size=32
+batch_size=16
 lr_adapt=False
 
 n_print_steps=100
@@ -40,7 +40,7 @@ te_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_validation.sv
 
 # exp_dir=./exp/self-pretrain
 # save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3
-save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_MINISET
+save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET
 mkdir -p $save_dir
 mkdir -p ${save_dir}/models
 

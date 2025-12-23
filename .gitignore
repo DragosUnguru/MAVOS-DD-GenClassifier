@@ -5,3 +5,6 @@ egs/exp/*
 src/__pycache__
 checkpoints/
 exp/
+**/subset/
+subset.zip
+.vscode

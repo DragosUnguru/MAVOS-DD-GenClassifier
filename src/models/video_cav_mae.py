@@ -469,7 +469,7 @@ class VideoCAVMAEFT(nn.Module):
             return x_masked, mask, ids_restore
 
 
-    def forward(self, audio, video, apply_mask=False, hard_mask=False, hard_mask_ratio=0.75, adversarial=False):
+    def forward(self, audio, video, apply_mask=False, hard_mask=False, hard_mask_ratio=0.75, adversarial=False, detach_features_for_gen=False):
         # audio: (B, 1024, 128)
         # video: (B, 3, 16, 224, 224)
 
@@ -509,15 +509,17 @@ class VideoCAVMAEFT(nn.Module):
         # Main classification head (real/fake detection)
         output = self.mlp_head(fused_features)
         
-        # Adversarial head for generative method classification
-        # The gradient reversal layer reverses gradients during backprop,
-        # so masking_net learns to HIDE generative method information
+        # Generative method classification head
         gen_output = None
         if adversarial:
-            # Apply gradient reversal before gen_classifier
-            # This makes masking_net try to minimize gen classification accuracy
-            reversed_features = self.gradient_reversal(fused_features)
-            gen_output = self.gen_classifier(reversed_features)
+            if detach_features_for_gen:
+                # Detach features: only gen_classifier receives gradients
+                # Used in Step 1 (discriminator update)
+                gen_output = self.gen_classifier(fused_features.detach())
+            else:
+                # Normal forward: gradients flow through everything
+                # Used in Step 2 (generator update) - masking_net learns to fool gen_classifier
+                gen_output = self.gen_classifier(fused_features)
         
         return output, gen_output, video_mask, ids_restore
     

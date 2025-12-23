@@ -424,11 +424,13 @@ class MavosDD(Dataset):
         # This is a 9-class multi-label vector (4 video + 5 audio methods)
         gen_label = torch.zeros(self.num_classes, dtype=torch.float)
 
-        assert video_class_name in self.video_class_name_to_idx, f"Video generative method '{video_class_name}' not found in class mapping."
-        gen_label[self.video_class_name_to_idx[video_class_name]] = 1.0
+        assert video_class_name == "real" or video_class_name in self.video_class_name_to_idx, f"Video generative method '{video_class_name}' not found in class mapping." 
+        if video_class_name != "real":
+            gen_label[self.video_class_name_to_idx[video_class_name]] = 1.0
 
-        assert audio_class_name in self.audio_class_name_to_idx, f"Audio generative method '{audio_class_name}' not found in class mapping."
-        gen_label[self.audio_class_name_to_idx[audio_class_name]] = 1.0
+        assert audio_class_name == "real" or audio_class_name in self.audio_class_name_to_idx, f"Audio generative method '{audio_class_name}' not found in class mapping."
+        if audio_class_name != "real":
+            gen_label[self.audio_class_name_to_idx[audio_class_name]] = 1.0
 
         return fbank, frames, main_label, gen_label, sample["video_path"]
 

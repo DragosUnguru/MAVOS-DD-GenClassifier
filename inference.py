@@ -11,9 +11,9 @@ from src.mavosdd_dataset import MavosDD
 
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
-CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/trainable_mask_binary_classification_2-STAGE-TRAINING/02-avff-trainable-mask-frozen"
+CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET"
 CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.10.pth"
-DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS-MASKED.json"
+DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS.json"
 
 # video_labels = {
 #     "memo": 0,
@@ -53,8 +53,15 @@ if __name__ == "__main__":
     mavos_dd = datasets.Dataset.load_from_disk(DATASET_INPUT_PATH)
 
     val_loader = torch.utils.data.DataLoader(
-        MavosDD(mavos_dd.filter(lambda sample: sample['split']=="test"), DATASET_INPUT_PATH, val_audio_conf, stage=2, custom_file_path=False),
-        batch_size=32, shuffle=False, num_workers=4, pin_memory=False
+        MavosDD(
+            mavos_dd.filter(lambda sample: sample['split']=="test"),
+            DATASET_INPUT_PATH,
+            val_audio_conf,
+            stage=2,
+            # video_class_name_to_idx=video_labels,
+            # audio_class_name_to_idx=audio_labels
+        ),
+        batch_size=32, shuffle=False, num_workers=2, pin_memory=False
     )
 
     A_predictions, A_targets = [], []
@@ -66,7 +73,7 @@ if __name__ == "__main__":
 
             with autocast():
                 # model_output = torch.round(torch.sigmoid(cavmae_ft(a_input, v_input))).cpu().numpy()
-                model_output, _, _ = cavmae_ft(a_input, v_input, apply_mask=True, hard_mask=True, hard_mask_ratio=0.4)
+                model_output, _, _, _ = cavmae_ft(a_input, v_input, apply_mask=True, hard_mask=True, hard_mask_ratio=0.4, adversarial=True)
                 model_output = model_output.cpu().numpy()
 
             for y_pred, y_true, video_path in zip(model_output, labels.numpy(), video_paths):

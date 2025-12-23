@@ -60,7 +60,7 @@ def plot_confusion_matrix_percent(y_true, y_pred, labels=None, normalize='true',
     plt.ylabel("True Label")
     plt.title(name)
     plt.tight_layout()
-    plt.savefig(f"/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/trainable_mask_binary_classification_COTRAINING/eval/{name}-UNMASKED.png")
+    plt.savefig(f"/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET/eval/{name}.png")
     plt.show()
     plt.close()
 
@@ -91,7 +91,7 @@ def evaluate_model(dataset):
     return stats   
     
 if __name__ == "__main__":
-    with open("/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/trainable_mask_binary_classification_COTRAINING/eval/audio_model.10.PREDICTIONS-UNMASKED.json") as input_json_file:
+    with open("/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET/eval/audio_model.10.PREDICTIONS.json") as input_json_file:
         preds_json = json.load(input_json_file)
 
     mavos_dd = datasets.Dataset.load_from_disk(DATASET_INPUT_PATH)

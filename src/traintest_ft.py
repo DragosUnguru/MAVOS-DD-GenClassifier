@@ -30,7 +30,7 @@ def train_adversarial(model, train_loader, test_loader, args):
     """
     Single-phase adversarial training with two optimization steps per iteration:
     
-    Step 1 (Discriminator update): 
+    Step 1 (Discriminator update):
         - Freeze masking_net, unfreeze gen_classifier
         - Train gen_classifier to correctly classify generative methods
 
@@ -171,35 +171,23 @@ def train_adversarial(model, train_loader, test_loader, args):
 
             # STEP 1: Train Discriminator (gen_classifier)
             # Goal: Correctly classify which generative method was used
-
             model.module.freeze_maskingnet()
             model.module.unfreeze_gen_classifier()
             
             optimizer_D.zero_grad()
             
             with autocast():
-                # Forward pass -- we need features but don't want gradients through masking_net
-                with torch.no_grad():
-                    # Get masked features without gradient
-                    output, gen_output_detached, video_mask, _ = model(
-                        a_input, v_input, 
-                        apply_mask=True, 
-                        hard_mask=True, 
-                        hard_mask_ratio=args.mask_ratio,
-                        adversarial=False  # Don't use GRL here
-                    )
-
-                # Re-compute gen_output with gradients for gen_classifier only
-                # We need to get the fused features and pass through gen_classifier
-                # This requires a slight modification -- for now, do a second forward
-                _, gen_output, _, _ = model(
+                # Single forward pass with detached features for gen_classifier
+                # This means gradients only flow through gen_classifier, not masking_net/backbone
+                _, gen_output, video_mask, _ = model(
                     a_input, v_input, 
                     apply_mask=True, 
                     hard_mask=True, 
                     hard_mask_ratio=args.mask_ratio,
-                    adversarial=True  # Get gen_output
+                    adversarial=True,
+                    detach_features_for_gen=True  # Detach features
                 )
-                
+
                 # Discriminator loss: classify generative methods correctly
                 loss_D = gen_loss_fn(gen_output, gen_labels)
             
@@ -213,20 +201,22 @@ def train_adversarial(model, train_loader, test_loader, args):
             # Goals: 
             #   - Masking_net: Fool the gen_classifier (adversarial)
             #   - Backbone: Correctly classify real/fake
-            
+
             model.module.unfreeze_maskingnet()
             model.module.freeze_gen_classifier()
-            
+
             optimizer_G.zero_grad()
-            
+
             with autocast():
                 # Forward pass with gradient through masking_net
+                # Don't detach features - we want gradients to flow back
                 output, gen_output, video_mask, _ = model(
                     a_input, v_input, 
                     apply_mask=True, 
-                    hard_mask=True, 
+                    hard_mask=False, 
                     hard_mask_ratio=args.mask_ratio,
-                    adversarial=True
+                    adversarial=True,
+                    detach_features_for_gen=False  # Gradients flow through
                 )
                 
                 # Main classification loss (real/fake)
