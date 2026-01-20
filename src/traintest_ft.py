@@ -10,6 +10,208 @@ from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
 
+def train_random_masking(model, train_loader, test_loader, args):
+    """
+    Simplified training with random masking (no adversarial components).
+    
+    Uses gradient-preserving random masking on video embeddings.
+    Trains the AVFF backbone for binary real/fake classification.
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    torch.set_grad_enabled(True)
+    
+    batch_time, per_sample_time, data_time, per_sample_data_time, per_sample_dnn_time = AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()
+    loss_meter = AverageMeter()
+    
+    best_epoch, best_mAP, best_acc = 0, -np.inf, -np.inf
+    global_step, epoch = 0, 0
+    start_time = time.time()
+    exp_dir = args.save_dir
+    
+    if not isinstance(model, torch.nn.DataParallel):
+        model = torch.nn.DataParallel(model)
+    
+    model.to(device)
+    
+    print("="*60)
+    print("Random Masking Training (no adversarial components)")
+    print("="*60)
+    print(f"  - Mask ratio: {args.mask_ratio}")
+    print(f"  - Masking mode: random (gradient-preserving)")
+    print("="*60)
+    
+    # Freeze masking_net since we're using random masking
+    model.module.freeze_maskingnet()
+    
+    # Setup parameter groups
+    mlp_list = [
+        'a2v.mlp.linear.weight', 'a2v.mlp.linear.bias',
+        'v2a.mlp.linear.weight', 'v2a.mlp.linear.bias',
+        'mlp_vision.weight', 'mlp_vision.bias',
+        'mlp_audio.weight', 'mlp_audio.bias',
+        'mlp_head.fc1.weight', 'mlp_head.fc1.bias',
+        'mlp_head.fc2.weight', 'mlp_head.fc2.bias',
+        'mlp_head.fc3.weight', 'mlp_head.fc3.bias',
+    ]
+    
+    mlp_params = []
+    base_params = []
+    
+    for name, param in model.module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name in mlp_list:
+            mlp_params.append(param)
+        else:
+            base_params.append(param)
+    
+    trainables = [p for p in model.parameters() if p.requires_grad]
+    print('Total parameter number is : {:.3f} million'.format(sum(p.numel() for p in model.parameters()) / 1e6))
+    print('Total trainable parameter number is : {:.3f} million'.format(sum(p.numel() for p in trainables) / 1e6))
+    
+    optimizer = torch.optim.Adam([
+        {'params': base_params, 'lr': args.lr},
+        {'params': mlp_params, 'lr': args.lr * args.head_lr}
+    ], weight_decay=5e-7, betas=(0.95, 0.999))
+    
+    print('base lr, mlp lr : ', args.lr, args.lr * args.head_lr)
+    
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer, 
+        list(range(args.lrscheduler_start, 1000, args.lrscheduler_step)),
+        gamma=args.lrscheduler_decay
+    )
+    
+    main_metrics = args.metrics
+    
+    # Loss function
+    if args.loss == 'BCE':
+        loss_fn = nn.BCEWithLogitsLoss()
+    elif args.loss == 'CE':
+        loss_fn = nn.CrossEntropyLoss()
+    args.loss_fn = loss_fn
+    
+    epoch += 1
+    scaler = GradScaler()
+    
+    print("current #steps=%s, #epochs=%s" % (global_step, epoch))
+    print("start random masking training...")
+    result = np.zeros([args.n_epochs, 4])  # acc, mAP, AUC, lr
+    model.train()
+    
+    while epoch < args.n_epochs + 1:
+        begin_time = time.time()
+        end_time = time.time()
+        model.train()
+        print('---------------')
+        print(datetime.datetime.now())
+        print("current #epochs=%s, #steps=%s" % (epoch, global_step))
+
+        for i, (a_input, v_input, labels, _) in enumerate(tqdm(train_loader)):
+            assert a_input.shape[0] == v_input.shape[0]
+            B = a_input.shape[0]
+            a_input = a_input.to(device, non_blocking=True)
+            v_input = v_input.to(device, non_blocking=True)
+            labels = labels.to(device)
+
+            data_time.update(time.time() - end_time)
+            per_sample_data_time.update((time.time() - end_time) / B)
+            dnn_start_time = time.time()
+
+            optimizer.zero_grad()
+            
+            with autocast():
+                # Forward with random masking (gradient-preserving)
+                output, _, video_mask, _ = model(
+                    a_input, v_input, 
+                    apply_mask=True, 
+                    masking_mode='random',
+                    hard_mask_ratio=args.mask_ratio,
+                    adversarial=False
+                )
+                
+                # Simple classification loss (no mask regularization needed)
+                loss = loss_fn(output, labels)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            loss_meter.update(loss.item(), B)
+            batch_time.update(time.time() - end_time)
+            per_sample_time.update((time.time() - end_time) / B)
+            per_sample_dnn_time.update((time.time() - dnn_start_time) / B)
+
+            print_step = global_step % args.n_print_steps == 0
+            early_print_step = epoch == 0 and global_step % (args.n_print_steps / 10) == 0
+            print_step = print_step or early_print_step
+
+            if print_step and global_step != 0:
+                print('Epoch: [{0}][{1}/{2}]\t'
+                  'Per Sample Time {per_sample_time.avg:.5f}\t'
+                  'Train Loss {loss_meter.val:.4f}\t'.format(
+                   epoch, i, len(train_loader), per_sample_time=per_sample_time,
+                   loss_meter=loss_meter), flush=True)
+                if np.isnan(loss_meter.avg):
+                    print("training diverged...")
+                    return
+
+            end_time = time.time()
+            global_step += 1
+        
+        print('start validation')
+        stats, valid_loss = validate(model, test_loader, args)
+
+        mAP = stats['AP_macro']
+        mAUC = stats['AUC_macro']
+        acc = stats['accuracy']
+
+        if main_metrics == 'mAP':
+            print("mAP: {:.6f}".format(mAP))
+        else:
+            print("acc: {:.6f}".format(acc))
+        print("AUC: {:.6f}".format(mAUC))
+        print("d_prime: {:.6f}".format(d_prime(mAUC)))
+        print("train_loss: {:.6f}".format(loss_meter.avg))
+        print("valid_loss: {:.6f}".format(valid_loss))
+
+        result[epoch-1, :] = [acc, mAP, mAUC, optimizer.param_groups[0]['lr']]
+        np.savetxt(exp_dir + '/result.csv', result, delimiter=',')
+        print('validation finished')
+        
+        if mAP > best_mAP:
+            best_mAP = mAP
+            if main_metrics == 'mAP':
+                best_epoch = epoch
+
+        if acc > best_acc:
+            best_acc = acc
+            if main_metrics == 'acc':
+                best_epoch = epoch
+
+        if best_epoch == epoch:
+            torch.save(model.state_dict(), "%s/models/best_audio_model.pth" % (exp_dir))
+            torch.save(optimizer.state_dict(), "%s/models/best_optim_state.pth" % (exp_dir))
+        if args.save_model == True:
+            torch.save(model.state_dict(), "%s/models/audio_model.%d.pth" % (exp_dir, epoch))
+        
+        scheduler.step()
+            
+        print('Epoch-{0} lr: {1}'.format(epoch, optimizer.param_groups[0]['lr']))
+        
+        finish_time = time.time()
+        print('epoch {:d} training time: {:.3f}'.format(epoch, finish_time-begin_time))
+
+        epoch += 1
+
+        batch_time.reset()
+        per_sample_time.reset()
+        data_time.reset()
+        per_sample_data_time.reset()
+        per_sample_dnn_time.reset()
+        loss_meter.reset()
+
+
 def forward_loss_mask(model, masking_output):
         """
         imgs: [N, 3, H, W]

@@ -469,7 +469,44 @@ class VideoCAVMAEFT(nn.Module):
             return x_masked, mask, ids_restore
 
 
-    def forward(self, audio, video, apply_mask=False, hard_mask=False, hard_mask_ratio=0.75, adversarial=False, detach_features_for_gen=False):
+    def apply_random_masking(self, x, mask_ratio):
+        """
+        Random masking that preserves gradients through x.
+        Uses multiplicative masking to ensure backpropagation is not cut off.
+        
+        x: (B, T, C) visual/audio token embeddings
+        mask_ratio: float, proportion of tokens to mask (0-1)
+        
+        Returns:
+            x_masked: masked embeddings (gradients flow through unmasked tokens)
+            mask: binary mask (1 = masked, 0 = kept) for visualization/analysis
+        """
+        B, T, C = x.shape
+        len_keep = int(T * (1 - mask_ratio))
+        
+        # Generate random scores for each token
+        noise = torch.rand(B, T, device=x.device)
+        
+        # Sort to get indices (random order since noise is random)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        
+        # Create binary mask: 0 for kept tokens, 1 for masked tokens
+        mask = torch.ones(B, T, device=x.device)
+        mask[:, :len_keep] = 0
+        
+        # Restore original token order
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+        
+        # CRITICAL: Apply mask via multiplication to preserve gradients through x
+        # (1 - mask) is 1 for kept tokens, 0 for masked tokens
+        # Gradients flow because: d(x * m)/dx = m
+        x_masked = x * (1 - mask).unsqueeze(-1)
+        
+        return x_masked, mask
+
+
+    def forward(self, audio, video, apply_mask=False, masking_mode='learned', hard_mask=False, hard_mask_ratio=0.75, adversarial=False, detach_features_for_gen=False):
         # audio: (B, 1024, 128)
         # video: (B, 3, 16, 224, 224)
 
@@ -479,9 +516,15 @@ class VideoCAVMAEFT(nn.Module):
         video_mask = None
         ids_restore = None
 
-        # Apply learned masking on visual embeddings
+        # Apply masking on visual embeddings
         if apply_mask:
-            video_emb, video_mask, ids_restore = self.apply_masking(video_emb, hard_mask, hard_mask_ratio)
+            if masking_mode == 'random':
+                video_emb, video_mask = self.apply_random_masking(video_emb, hard_mask_ratio)
+                ids_restore = None
+            elif masking_mode == 'learned':
+                # Learned masking via MaskingNet (adversarial training)
+                video_emb, video_mask, ids_restore = self.apply_masking(video_emb, hard_mask, hard_mask_ratio)
+            # else: masking_mode == 'none' - no masking applied
 
         # Rearrange audio and video embeddings to perform temporal complementary mask
         b, t, c = audio_emb.shape
