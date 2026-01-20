@@ -577,3 +577,311 @@ def validate(model, val_loader, args, output_pred=False):
     else:
         # used for multi-frame evaluation (i.e., ensemble over frames), so return prediction and target
         return stats, audio_output, target
+
+
+def validate_contrastive(model, val_loader, args, output_pred=False):
+    """Validation function for contrastive learning model."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch_time = AverageMeter()
+    if not isinstance(model, nn.DataParallel):
+        model = nn.DataParallel(model)
+    model = model.to(device)
+    model.eval()
+
+    end = time.time()
+    A_predictions, A_targets, A_loss = [], [], []
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(val_loader)):
+            # Handle both formats
+            if len(batch) == 5:
+                a_input, v_input, labels, gen_labels, _ = batch
+            else:
+                a_input, v_input, labels, _ = batch
+            
+            a_input = a_input.to(device)
+            v_input = v_input.to(device)
+            labels = labels.to(device)
+
+            with autocast():
+                # Contrastive model returns (output, video_mask, projections)
+                output, _, _ = model(a_input, v_input, apply_mask=False, return_projections=False)
+
+            predictions = output.to('cpu').detach()
+
+            A_predictions.append(predictions)
+            A_targets.append(labels)
+
+            loss = args.loss_fn(output, labels)
+            A_loss.append(loss.to('cpu').detach())
+
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+        audio_output = torch.cat(A_predictions)
+        target = torch.cat(A_targets)
+        loss = np.mean(A_loss)
+
+        stats = calculate_stats(audio_output.cpu(), target.cpu())
+
+    if output_pred == False:
+        return stats, loss
+    else:
+        return stats, audio_output, target
+
+
+def train_contrastive(model, train_loader, test_loader, args):
+    """
+    Contrastive learning training loop.
+    
+    This approach combines:
+    1. Supervised Contrastive Loss: Clusters same-class samples (real vs fake)
+    2. Cross-Modal Contrastive Loss: Aligns audio-video pairs
+    3. Classification Loss: Standard BCE/CE for real/fake prediction
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    torch.set_grad_enabled(True)
+    
+    batch_time = AverageMeter()
+    per_sample_time = AverageMeter()
+    data_time = AverageMeter()
+    per_sample_data_time = AverageMeter()
+    per_sample_dnn_time = AverageMeter()
+    
+    cls_loss_meter = AverageMeter()
+    supcon_loss_meter = AverageMeter()
+    crossmodal_loss_meter = AverageMeter()
+    crossmodal_acc_meter = AverageMeter()
+    total_loss_meter = AverageMeter()
+    
+    best_epoch, best_mAP, best_acc = 0, -np.inf, -np.inf
+    global_step, epoch = 0, 0
+    start_time = time.time()
+    exp_dir = args.save_dir
+    
+    if not isinstance(model, torch.nn.DataParallel):
+        model = torch.nn.DataParallel(model)
+    
+    model.to(device)
+    
+    print("="*60)
+    print("Contrastive Learning Training")
+    print("="*60)
+    print(f"  - Temperature: {args.temperature}")
+    print(f"  - SupCon weight: {args.supcon_weight}")
+    print(f"  - Cross-modal weight: {args.crossmodal_weight}")
+    print(f"  - Classification weight: {args.cls_weight}")
+    print(f"  - Overall contrastive weight: {args.contrastive_weight}")
+    print("="*60)
+    
+    # Setup parameter groups
+    mlp_list = [
+        'a2v.mlp.linear.weight', 'a2v.mlp.linear.bias',
+        'v2a.mlp.linear.weight', 'v2a.mlp.linear.bias',
+        'mlp_vision.weight', 'mlp_vision.bias',
+        'mlp_audio.weight', 'mlp_audio.bias',
+        'mlp_head.fc1.weight', 'mlp_head.fc1.bias',
+        'mlp_head.fc2.weight', 'mlp_head.fc2.bias',
+        'mlp_head.fc3.weight', 'mlp_head.fc3.bias',
+    ]
+    
+    # Projection heads should use higher LR (newly initialized)
+    projector_params = []
+    mlp_params = []
+    base_params = []
+    
+    for name, param in model.module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'projector' in name:
+            projector_params.append(param)
+        elif name in mlp_list:
+            mlp_params.append(param)
+        else:
+            base_params.append(param)
+    
+    optimizer = torch.optim.Adam([
+        {'params': base_params, 'lr': args.lr},
+        {'params': mlp_params, 'lr': args.lr * args.head_lr},
+        {'params': projector_params, 'lr': args.lr * args.head_lr}
+    ], weight_decay=5e-7, betas=(0.95, 0.999))
+    
+    trainables = [p for p in model.parameters() if p.requires_grad]
+    print('Total parameter number: {:.3f} M'.format(sum(p.numel() for p in model.parameters()) / 1e6))
+    print('Total trainable parameter number: {:.3f} M'.format(sum(p.numel() for p in trainables) / 1e6))
+    print('Projector parameter number: {:.3f} M'.format(sum(p.numel() for p in projector_params) / 1e6))
+    
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        list(range(args.lrscheduler_start, 1000, args.lrscheduler_step)),
+        gamma=args.lrscheduler_decay
+    )
+    
+    main_metrics = args.metrics
+    
+    # Classification loss
+    if args.loss == 'BCE':
+        loss_fn = nn.BCEWithLogitsLoss()
+    elif args.loss == 'CE':
+        loss_fn = nn.CrossEntropyLoss()
+    args.loss_fn = loss_fn
+    
+    epoch += 1
+    scaler = GradScaler()
+    
+    print("current #steps=%s, #epochs=%s" % (global_step, epoch))
+    print("Starting contrastive training...")
+    
+    # Results: acc, mAP, AUC, lr, supcon_loss, crossmodal_loss, crossmodal_acc
+    result = np.zeros([args.n_epochs, 7])
+    model.train()
+    
+    while epoch < args.n_epochs + 1:
+        begin_time = time.time()
+        end_time = time.time()
+        model.train()
+        
+        print('---------------')
+        print(datetime.datetime.now())
+        print("current #epochs=%s, #steps=%s" % (epoch, global_step))
+
+        for i, batch in enumerate(tqdm(train_loader)):
+            # Handle both formats
+            if len(batch) == 5:
+                a_input, v_input, labels, gen_labels, _ = batch
+            else:
+                a_input, v_input, labels, _ = batch
+            
+            B = a_input.shape[0]
+            a_input = a_input.to(device, non_blocking=True)
+            v_input = v_input.to(device, non_blocking=True)
+            labels = labels.to(device)
+
+            data_time.update(time.time() - end_time)
+            per_sample_data_time.update((time.time() - end_time) / B)
+            dnn_start_time = time.time()
+
+            optimizer.zero_grad()
+
+            with autocast():
+                # Forward pass with projections for contrastive loss
+                output, video_mask, projections = model(
+                    a_input, v_input,
+                    apply_mask=args.apply_mask if hasattr(args, 'apply_mask') else False,
+                    hard_mask=True,
+                    hard_mask_ratio=args.mask_ratio if hasattr(args, 'mask_ratio') else 0.4,
+                    return_projections=True
+                )
+                
+                # Classification loss
+                cls_loss = loss_fn(output, labels)
+                
+                # Contrastive losses
+                contrastive_loss, loss_dict = model.module.compute_contrastive_losses(
+                    projections, labels,
+                    supcon_weight=args.supcon_weight,
+                    crossmodal_weight=args.crossmodal_weight
+                )
+                
+                # Total loss
+                total_loss = args.cls_weight * cls_loss + args.contrastive_weight * contrastive_loss
+
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # Update meters
+            cls_loss_meter.update(cls_loss.item(), B)
+            supcon_loss_meter.update(loss_dict['supcon_loss'], B)
+            crossmodal_loss_meter.update(loss_dict['crossmodal_loss'], B)
+            crossmodal_acc_meter.update(loss_dict['crossmodal_acc'], B)
+            total_loss_meter.update(total_loss.item(), B)
+            
+            batch_time.update(time.time() - end_time)
+            per_sample_time.update((time.time() - end_time) / B)
+            per_sample_dnn_time.update((time.time() - dnn_start_time) / B)
+
+            print_step = global_step % args.n_print_steps == 0
+            early_print_step = epoch == 0 and global_step % (args.n_print_steps/10) == 0
+            print_step = print_step or early_print_step
+
+            if print_step and global_step != 0:
+                print('Epoch: [{0}][{1}/{2}]\t'
+                      'Per Sample Time {per_sample_time.avg:.5f}\t'
+                      'Cls Loss {cls_loss.val:.4f}\t'
+                      'SupCon Loss {supcon_loss.val:.4f}\t'
+                      'XModal Loss {xmodal_loss.val:.4f}\t'
+                      'XModal Acc {xmodal_acc.val:.3f}\t'.format(
+                       epoch, i, len(train_loader),
+                       per_sample_time=per_sample_time,
+                       cls_loss=cls_loss_meter,
+                       supcon_loss=supcon_loss_meter,
+                       xmodal_loss=crossmodal_loss_meter,
+                       xmodal_acc=crossmodal_acc_meter), flush=True)
+                
+                if np.isnan(total_loss_meter.avg):
+                    print("Training diverged...")
+                    return
+
+            end_time = time.time()
+            global_step += 1
+        
+        print('Starting validation...')
+        stats, valid_loss = validate_contrastive(model, test_loader, args)
+
+        mAP = stats['AP_macro']
+        mAUC = stats['AUC_macro']
+        acc = stats['accuracy']
+
+        if main_metrics == 'mAP':
+            print("mAP: {:.6f}".format(mAP))
+        else:
+            print("acc: {:.6f}".format(acc))
+        print("AUC: {:.6f}".format(mAUC))
+        print("d_prime: {:.6f}".format(d_prime(mAUC)))
+        print("train_cls_loss: {:.6f}".format(cls_loss_meter.avg))
+        print("train_supcon_loss: {:.6f}".format(supcon_loss_meter.avg))
+        print("train_crossmodal_loss: {:.6f}".format(crossmodal_loss_meter.avg))
+        print("train_crossmodal_acc: {:.6f}".format(crossmodal_acc_meter.avg))
+        print("valid_loss: {:.6f}".format(valid_loss))
+
+        result[epoch-1, :] = [acc, mAP, mAUC, optimizer.param_groups[0]['lr'],
+                              supcon_loss_meter.avg, crossmodal_loss_meter.avg, crossmodal_acc_meter.avg]
+        np.savetxt(exp_dir + '/result.csv', result, delimiter=',')
+        print('Validation finished')
+        
+        if mAP > best_mAP:
+            best_mAP = mAP
+            if main_metrics == 'mAP':
+                best_epoch = epoch
+
+        if acc > best_acc:
+            best_acc = acc
+            if main_metrics == 'acc':
+                best_epoch = epoch
+
+        if best_epoch == epoch:
+            torch.save(model.state_dict(), "%s/models/best_model.pth" % (exp_dir))
+            torch.save(optimizer.state_dict(), "%s/models/best_optim_state.pth" % (exp_dir))
+        if args.save_model:
+            torch.save(model.state_dict(), "%s/models/model.%d.pth" % (exp_dir, epoch))
+        
+        scheduler.step()
+            
+        print('Epoch-{0} lr: {1}'.format(epoch, optimizer.param_groups[0]['lr']))
+        
+        finish_time = time.time()
+        print('Epoch {:d} training time: {:.3f}'.format(epoch, finish_time - begin_time))
+
+        epoch += 1
+
+        # Reset meters
+        batch_time.reset()
+        per_sample_time.reset()
+        data_time.reset()
+        per_sample_data_time.reset()
+        per_sample_dnn_time.reset()
+        cls_loss_meter.reset()
+        supcon_loss_meter.reset()
+        crossmodal_loss_meter.reset()
+        crossmodal_acc_meter.reset()
+        total_loss_meter.reset()

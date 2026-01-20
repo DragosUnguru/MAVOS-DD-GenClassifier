@@ -56,13 +56,13 @@ def plot_confusion_matrix_percent(y_true, y_pred, labels=None, normalize='true',
         sns.heatmap(cm_percent, annot=True, fmt=".2f", cmap="Blues", xticklabels=['Fake', "Real"], yticklabels=['Fake', "Real"], cbar=False)
     else:
         sns.heatmap(cm_percent, annot=True, fmt=".2f", cmap="Blues", xticklabels=['Fake', "Real"], yticklabels=['Fake', "Real"], cbar=False)
-    plt.xlabel("Predicted Label", labelpad=20)
-    plt.ylabel("True Label")
-    plt.title(name)
-    plt.tight_layout()
-    plt.savefig(f"/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET/eval/{name}.png")
-    plt.show()
-    plt.close()
+    # plt.xlabel("Predicted Label", labelpad=20)
+    # plt.ylabel("True Label")
+    # plt.title(name)
+    # plt.tight_layout()
+    # plt.savefig(f"/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET/eval/{name}.png")
+    # # plt.show()
+    # # plt.close()
 
 def evaluate_model(dataset):
     val_loader = torch.utils.data.DataLoader(
@@ -91,7 +91,7 @@ def evaluate_model(dataset):
     return stats   
     
 if __name__ == "__main__":
-    with open("/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET/eval/audio_model.10.PREDICTIONS.json") as input_json_file:
+    with open("/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET_03/eval/audio_model.10.PREDICTIONS.json") as input_json_file:
         preds_json = json.load(input_json_file)
 
     mavos_dd = datasets.Dataset.load_from_disk(DATASET_INPUT_PATH)
@@ -139,7 +139,7 @@ if __name__ == "__main__":
         # wandb.log({f"{split_to_evaluate}_mAP": mAP, f"{split_to_evaluate}_AUC":mAUC, f"{split_to_evaluate}_accuracy":acc})
         print(f"{split_to_evaluate}: {mAP=}, {mAUC=}, {acc=}\n")
     
-        plot_confusion_matrix_percent(np.argmax(y_true, axis=1), np.argmax(y_pred, axis=1), name=split_to_evaluate)
+        # plot_confusion_matrix_percent(np.argmax(y_true, axis=1), np.argmax(y_pred, axis=1), name=split_to_evaluate)
 
 """
 Fine-tuned:

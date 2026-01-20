@@ -40,7 +40,7 @@ te_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_validation.sv
 
 # exp_dir=./exp/self-pretrain
 # save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3
-save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET
+save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET_03
 mkdir -p $save_dir
 mkdir -p ${save_dir}/models
 
