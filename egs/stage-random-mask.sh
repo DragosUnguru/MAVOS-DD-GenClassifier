@@ -32,7 +32,7 @@ tr_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_train.csv
 te_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_validation.sv
 
 # Output directory
-save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET_03
+save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/binary_classification_RANDOM_mask_experiment_MINISET_03
 mkdir -p $save_dir
 mkdir -p ${save_dir}/models
 
@@ -56,4 +56,4 @@ CUDA_CACHE_DISABLE=1 python -W ignore ../src/run_ft_random_masking.py \
     --n_print_steps ${n_print_steps} \
     --metrics mAP \
     --loss BCE \
-    --miniset True
+    --miniset

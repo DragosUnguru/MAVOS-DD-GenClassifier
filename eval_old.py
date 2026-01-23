@@ -91,7 +91,7 @@ def evaluate_model(dataset):
     return stats   
     
 if __name__ == "__main__":
-    with open("/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET_03/eval/audio_model.10.PREDICTIONS.json") as input_json_file:
+    with open("/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/binary_classification_RANDOM_mask_experiment_MINISET_03/eval/audio_model.10.PREDICTIONS.json") as input_json_file:
         preds_json = json.load(input_json_file)
 
     mavos_dd = datasets.Dataset.load_from_disk(DATASET_INPUT_PATH)
@@ -104,6 +104,7 @@ if __name__ == "__main__":
     split_to_evaluate = "open-model"
     split_to_evaluate = "open-language"
     split_to_evaluate = "open-set"
+    result = {}
     for split_to_evaluate in ["closed-set", "open-model", "open-language",  "open-set"]:
         if split_to_evaluate == "closed-set":
             # Test closed-set
@@ -138,6 +139,13 @@ if __name__ == "__main__":
         acc = stats[0]['acc'] # this is just a trick, acc of each class entry is the same, which is the accuracy of all classes, not class-wise accuracy
         # wandb.log({f"{split_to_evaluate}_mAP": mAP, f"{split_to_evaluate}_AUC":mAUC, f"{split_to_evaluate}_accuracy":acc})
         print(f"{split_to_evaluate}: {mAP=}, {mAUC=}, {acc=}\n")
+
+        result[split_to_evaluate] = {
+            'mAP': mAP,
+            'mAUC': mAUC,
+            'acc': acc
+        }
+    print(result)
     
         # plot_confusion_matrix_percent(np.argmax(y_true, axis=1), np.argmax(y_pred, axis=1), name=split_to_evaluate)
 

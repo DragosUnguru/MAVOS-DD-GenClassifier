@@ -11,7 +11,7 @@ from src.mavosdd_dataset import MavosDD
 
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
-CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET_03"
+CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/binary_classification_RANDOM_mask_experiment_MINISET_03"
 CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.10.pth"
 DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS.json"
 
@@ -73,7 +73,14 @@ if __name__ == "__main__":
 
             with autocast():
                 # model_output = torch.round(torch.sigmoid(cavmae_ft(a_input, v_input))).cpu().numpy()
-                model_output, _, _, _ = cavmae_ft(a_input, v_input, apply_mask=True, hard_mask=True, hard_mask_ratio=0.4, adversarial=True)
+                # model_output, _, _, _ = cavmae_ft(a_input, v_input, apply_mask=True, hard_mask=True, hard_mask_ratio=0.4, adversarial=True)
+                model_output, _, _, _ = cavmae_ft(
+                    a_input, v_input, 
+                    apply_mask=True, 
+                    masking_mode='random',
+                    hard_mask_ratio=0.4,
+                    adversarial=False
+                )
                 model_output = model_output.cpu().numpy()
 
             for y_pred, y_true, video_path in zip(model_output, labels.numpy(), video_paths):
