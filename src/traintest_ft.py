@@ -122,7 +122,7 @@ def train_random_masking(model, train_loader, test_loader, args):
             
             with autocast():
                 # Forward with random masking (gradient-preserving)
-                output, _, video_mask, _ = model(
+                output, _, video_mask, _, _ = model(
                     a_input, v_input, 
                     apply_mask=True, 
                     masking_mode='random',
@@ -373,6 +373,8 @@ def train_adversarial(model, train_loader, test_loader, args):
 
             # STEP 1: Train Discriminator (gen_classifier)
             # Goal: Correctly classify which generative method was used
+            # NOTE: Use hard_mask=True with STE so gen_classifier sees hard-masked features
+            # (no information leakage) but gradients can still flow in Step 2.
             model.module.freeze_maskingnet()
             model.module.unfreeze_gen_classifier()
             
@@ -381,17 +383,25 @@ def train_adversarial(model, train_loader, test_loader, args):
             with autocast():
                 # Single forward pass with detached features for gen_classifier
                 # This means gradients only flow through gen_classifier, not masking_net/backbone
-                _, gen_output, video_mask, _ = model(
+                # hard_mask=True + use_ste=True: AVFF sees hard zeros, but STE preserves gradient path
+                _, gen_output, video_mask, _, _ = model(
                     a_input, v_input, 
                     apply_mask=True, 
-                    hard_mask=True, 
+                    hard_mask=True,  # Hard mask: AVFF sees zeros (no info leakage)
                     hard_mask_ratio=args.mask_ratio,
                     adversarial=True,
-                    detach_features_for_gen=True  # Detach features
+                    detach_features_for_gen=True,  # Detach features for discriminator
+                    use_ste=True  # Straight-Through Estimator for gradient flow
                 )
 
                 # Discriminator loss: classify generative methods correctly
-                loss_D = gen_loss_fn(gen_output, gen_labels)
+                # Only compute loss for fake samples (real samples have gen_labels = all zeros)
+                fake_mask = gen_labels.sum(dim=1) > 0  # Samples with at least one generative method
+                if fake_mask.any():
+                    loss_D = gen_loss_fn(gen_output[fake_mask], gen_labels[fake_mask])
+                else:
+                    # No fake samples in batch, skip discriminator update
+                    loss_D = torch.tensor(0.0, device=device, requires_grad=True)
             
             scaler.scale(loss_D).backward()
             scaler.step(optimizer_D)
@@ -410,15 +420,17 @@ def train_adversarial(model, train_loader, test_loader, args):
             optimizer_G.zero_grad()
 
             with autocast():
-                # Forward pass with gradient through masking_net
-                # Don't detach features - we want gradients to flow back
-                output, gen_output, video_mask, _ = model(
+                # Forward pass with gradient through masking_net via STE
+                # hard_mask=True: AVFF sees hard zeros (no information leakage)
+                # use_ste=True: gradients flow back through masking_net
+                output, gen_output, video_mask, _, _ = model(
                     a_input, v_input, 
                     apply_mask=True, 
-                    hard_mask=False, 
+                    hard_mask=True,  # Hard mask: AVFF sees zeros (no info leakage)
                     hard_mask_ratio=args.mask_ratio,
                     adversarial=True,
-                    detach_features_for_gen=False  # Gradients flow through
+                    detach_features_for_gen=False,  # Gradients flow through to masking_net
+                    use_ste=True  # Straight-Through Estimator for gradient flow
                 )
                 
                 # Main classification loss (real/fake)
@@ -426,7 +438,12 @@ def train_adversarial(model, train_loader, test_loader, args):
                 
                 # Adversarial loss: FOOL the gen_classifier
                 # We want gen_classifier to be WRONG, so we maximize its loss
-                adv_loss = -gen_loss_fn(gen_output, gen_labels)
+                # Only compute for fake samples (real samples have gen_labels = all zeros)
+                fake_mask = gen_labels.sum(dim=1) > 0
+                if fake_mask.any():
+                    adv_loss = -gen_loss_fn(gen_output[fake_mask], gen_labels[fake_mask])
+                else:
+                    adv_loss = torch.tensor(0.0, device=device)
                 
                 # Mask regularization loss (optional)
                 mask_reg_loss = 0.0
@@ -528,6 +545,340 @@ def train_adversarial(model, train_loader, test_loader, args):
         loss_meter.reset()
         gen_loss_meter.reset()
         adv_loss_meter.reset()
+
+
+def train_contrastive(model, train_loader, test_loader, args):
+    """
+    Contrastive training with two optimization steps per iteration:
+    
+    The goal is to make features INVARIANT to the generative method (domain confusion).
+    This is similar to adversarial training but uses contrastive loss instead.
+    
+    Step 1 (Projection head update):
+        - Freeze masking_net, unfreeze projection_head
+        - Train projection_head with supervised contrastive loss to create embeddings
+          where samples with the SAME generative method are similar
+          (this gives the masking_net a target to confuse)
+
+    Step 2 (Generator/Main task update):
+        - Freeze projection_head, unfreeze masking_net + backbone
+        - Train masking_net with DOMAIN CONFUSION loss (reverse contrastive)
+          to make features from DIFFERENT methods similar (invariant to method)
+        - Train backbone for main real/fake classification
+    """
+    from utilities.contrastive import SupConLoss, DomainConfusionLoss
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    torch.set_grad_enabled(True)
+    
+    batch_time, per_sample_time, data_time, per_sample_data_time, per_sample_dnn_time = AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()
+    loss_meter = AverageMeter()
+    supcon_loss_meter = AverageMeter()
+    domain_loss_meter = AverageMeter()
+    
+    best_epoch, best_mAP, best_acc = 0, -np.inf, -np.inf
+    global_step, epoch = 0, 0
+    start_time = time.time()
+    exp_dir = args.save_dir
+    
+    if not isinstance(model, torch.nn.DataParallel):
+        model = torch.nn.DataParallel(model)
+    
+    model.to(device)
+    
+    # Get contrastive hyperparameters with defaults
+    temperature = getattr(args, 'temperature', 0.07)
+    lambda_domain = getattr(args, 'lambda_domain', 1.0)
+    
+    print("="*60)
+    print("Contrastive Training: Two-step optimization per iteration")
+    print("="*60)
+    print(f"  - Temperature: {temperature}")
+    print(f"  - Lambda domain confusion: {lambda_domain}")
+    print(f"  - Mask ratio: {args.mask_ratio}")
+    print("="*60)
+    
+    # Setup parameter groups for different components
+    # 1. Projection head parameters
+    projection_head_params = list(model.module.projection_head.parameters())
+    
+    # 2. Masking net parameters  
+    masking_net_params = list(model.module.masking_net.parameters())
+    
+    # 3. Backbone + main classifier parameters (everything else)
+    projection_head_names = set([f'projection_head.{n}' for n, _ in model.module.projection_head.named_parameters()])
+    masking_net_names = set([f'masking_net.{n}' for n, _ in model.module.masking_net.named_parameters()])
+    
+    backbone_params = []
+    mlp_params = []
+    
+    mlp_list = [
+        'a2v.mlp.linear.weight', 'a2v.mlp.linear.bias',
+        'v2a.mlp.linear.weight', 'v2a.mlp.linear.bias',
+        'mlp_vision.weight', 'mlp_vision.bias',
+        'mlp_audio.weight', 'mlp_audio.bias',
+        'mlp_head.fc1.weight', 'mlp_head.fc1.bias',
+        'mlp_head.fc2.weight', 'mlp_head.fc2.bias',
+        'mlp_head.fc3.weight', 'mlp_head.fc3.bias',
+    ]
+    
+    for name, param in model.module.named_parameters():
+        if name in projection_head_names or name in masking_net_names:
+            continue
+        # Also skip gen_classifier (not used in contrastive training)
+        if 'gen_classifier' in name:
+            continue
+        if name in mlp_list:
+            mlp_params.append(param)
+        else:
+            backbone_params.append(param)
+    
+    # Optimizer for projection_head (contrastive embedding space)
+    optimizer_P = torch.optim.Adam(
+        projection_head_params,
+        lr=args.lr * args.head_lr,
+        weight_decay=5e-7,
+        betas=(0.95, 0.999)
+    )
+    
+    # Optimizer for masking_net + backbone + main classifier
+    optimizer_G = torch.optim.Adam([
+        {'params': masking_net_params, 'lr': args.lr},
+        {'params': backbone_params, 'lr': args.lr},
+        {'params': mlp_params, 'lr': args.lr * args.head_lr}
+    ], weight_decay=5e-7, betas=(0.95, 0.999))
+    
+    trainables = [p for p in model.parameters() if p.requires_grad]
+    print('Total parameter number is : {:.3f} million'.format(sum(p.numel() for p in model.parameters()) / 1e6))
+    print('Total trainable parameter number is : {:.3f} million'.format(sum(p.numel() for p in trainables) / 1e6))
+    print('Projection head parameter number is : {:.3f} million'.format(sum(p.numel() for p in projection_head_params) / 1e6))
+    print('Masking net parameter number is : {:.3f} million'.format(sum(p.numel() for p in masking_net_params) / 1e6))
+    
+    scheduler_P = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer_P, 
+        list(range(args.lrscheduler_start, 1000, args.lrscheduler_step)),
+        gamma=args.lrscheduler_decay
+    )
+    scheduler_G = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer_G, 
+        list(range(args.lrscheduler_start, 1000, args.lrscheduler_step)),
+        gamma=args.lrscheduler_decay
+    )
+    
+    main_metrics = args.metrics
+    
+    # Loss functions
+    if args.loss == 'BCE':
+        loss_fn = nn.BCEWithLogitsLoss()
+    elif args.loss == 'CE':
+        loss_fn = nn.CrossEntropyLoss()
+    args.loss_fn = loss_fn
+    
+    # Contrastive losses
+    supcon_loss_fn = SupConLoss(temperature=temperature)
+    domain_confusion_fn = DomainConfusionLoss(temperature=temperature, mode='contrastive')
+    
+    epoch += 1
+    scaler = GradScaler()
+    
+    print("current #steps=%s, #epochs=%s" % (global_step, epoch))
+    print("start contrastive training...")
+    result = np.zeros([args.n_epochs, 6])  # acc, mAP, AUC, lr, supcon_loss, domain_loss
+    model.train()
+    
+    while epoch < args.n_epochs + 1:
+        begin_time = time.time()
+        end_time = time.time()
+        model.train()
+        print('---------------')
+        print(datetime.datetime.now())
+        print("current #epochs=%s, #steps=%s" % (epoch, global_step))
+
+        for i, (a_input, v_input, labels, gen_labels, _) in enumerate(tqdm(train_loader)):
+            assert a_input.shape[0] == v_input.shape[0]
+            B = a_input.shape[0]
+            a_input = a_input.to(device, non_blocking=True)
+            v_input = v_input.to(device, non_blocking=True)
+            labels = labels.to(device)
+            gen_labels = gen_labels.to(device)
+
+            data_time.update(time.time() - end_time)
+            per_sample_data_time.update((time.time() - end_time) / B)
+            dnn_start_time = time.time()
+
+            # STEP 1: Train Projection Head (contrastive embedding space)
+            # Goal: Create embeddings where same-method samples cluster together
+            # This gives masking_net a clear structure to confuse
+            model.module.freeze_maskingnet()
+            model.module.unfreeze_projection_head()
+            
+            optimizer_P.zero_grad()
+            
+            with autocast():
+                # Forward pass with detached features for projection head
+                # hard_mask=True + use_ste=True: AVFF sees hard zeros, STE preserves gradient path
+                _, _, video_mask, _, projection = model(
+                    a_input, v_input, 
+                    apply_mask=True, 
+                    hard_mask=True,  # Hard mask: AVFF sees zeros (no info leakage)
+                    hard_mask_ratio=args.mask_ratio,
+                    adversarial=False,
+                    detach_features_for_gen=True,  # Detach features for projection head
+                    return_projection=True,
+                    use_ste=True  # Straight-Through Estimator for gradient flow
+                )
+
+                # Supervised contrastive loss: same gen_labels → similar embeddings
+                # Only compute for fake samples (real samples have gen_labels = all zeros)
+                fake_mask = gen_labels.sum(dim=1) > 0
+                if fake_mask.any() and fake_mask.sum() > 1:
+                    # Need at least 2 samples for contrastive loss
+                    loss_P = supcon_loss_fn(projection[fake_mask], gen_labels[fake_mask])
+                else:
+                    loss_P = torch.tensor(0.0, device=device, requires_grad=True)
+            
+            scaler.scale(loss_P).backward()
+            scaler.step(optimizer_P)
+            scaler.update()
+            
+            supcon_loss_meter.update(loss_P.item(), B)
+            
+            # STEP 2: Train Generator (masking_net) + Main Task (backbone)
+            # Goals: 
+            #   - Masking_net: Domain confusion (make DIFFERENT methods similar)
+            #   - Backbone: Correctly classify real/fake
+
+            model.module.unfreeze_maskingnet()
+            model.module.freeze_projection_head()
+
+            optimizer_G.zero_grad()
+
+            with autocast():
+                # Forward pass with gradient through masking_net via STE
+                # hard_mask=True: AVFF sees hard zeros (no information leakage)
+                # use_ste=True: gradients flow back through masking_net
+                output, _, video_mask, _, projection = model(
+                    a_input, v_input, 
+                    apply_mask=True, 
+                    hard_mask=True,  # Hard mask: AVFF sees zeros (no info leakage)
+                    hard_mask_ratio=args.mask_ratio,
+                    adversarial=False,
+                    detach_features_for_gen=False,  # Gradients flow through to masking_net
+                    return_projection=True,
+                    use_ste=True  # Straight-Through Estimator for gradient flow
+                )
+                
+                # Main classification loss (real/fake)
+                main_loss = loss_fn(output, labels)
+                
+                # Domain confusion loss: make features from DIFFERENT methods similar
+                # This is the reverse of supervised contrastive
+                fake_mask = gen_labels.sum(dim=1) > 0
+                if fake_mask.any() and fake_mask.sum() > 1:
+                    domain_loss = domain_confusion_fn(projection[fake_mask], gen_labels[fake_mask])
+                else:
+                    domain_loss = torch.tensor(0.0, device=device)
+                
+                # Mask regularization loss (optional)
+                mask_reg_loss = 0.0
+                if video_mask is not None and hasattr(args, 'mask_loss_lambda') and args.mask_loss_lambda > 0:
+                    mask_reg_loss = args.mask_loss_lambda * sum(forward_loss_mask(model.module, video_mask))
+                
+                # Total generator loss
+                loss_G = main_loss + lambda_domain * domain_loss + mask_reg_loss
+
+            scaler.scale(loss_G).backward()
+            scaler.step(optimizer_G)
+            scaler.update()
+            
+            loss_meter.update(main_loss.item(), B)
+            domain_loss_meter.update(domain_loss.item() if torch.is_tensor(domain_loss) else domain_loss, B)
+            
+            batch_time.update(time.time() - end_time)
+            per_sample_time.update((time.time() - end_time)/a_input.shape[0])
+            per_sample_dnn_time.update((time.time() - dnn_start_time)/a_input.shape[0])
+
+            print_step = global_step % args.n_print_steps == 0
+            early_print_step = epoch == 0 and global_step % (args.n_print_steps/10) == 0
+            print_step = print_step or early_print_step
+
+            if print_step and global_step != 0:
+                print('Epoch: [{0}][{1}/{2}]\t'
+                  'Per Sample Time {per_sample_time.avg:.5f}\t'
+                  'Main Loss {loss_meter.val:.4f}\t'
+                  'SupCon Loss (P) {supcon_loss_meter.val:.4f}\t'
+                  'Domain Loss (G) {domain_loss_meter.val:.4f}\t'.format(
+                   epoch, i, len(train_loader), per_sample_time=per_sample_time,
+                   loss_meter=loss_meter, supcon_loss_meter=supcon_loss_meter, 
+                   domain_loss_meter=domain_loss_meter), flush=True)
+                if np.isnan(loss_meter.avg):
+                    print("training diverged...")
+                    return
+
+            end_time = time.time()
+            global_step += 1
+        
+        print('start validation')
+
+        # Unfreeze everything for validation
+        model.module.unfreeze_maskingnet()
+        model.module.unfreeze_projection_head()
+        
+        stats, valid_loss = validate(model, test_loader, args)
+
+        mAP = stats['AP_macro']
+        mAUC = stats['AUC_macro']
+        acc = stats['accuracy']
+
+        if main_metrics == 'mAP':
+            print("mAP: {:.6f}".format(mAP))
+        else:
+            print("acc: {:.6f}".format(acc))
+        print("AUC: {:.6f}".format(mAUC))
+        print("d_prime: {:.6f}".format(d_prime(mAUC)))
+        print("train_loss: {:.6f}".format(loss_meter.avg))
+        print("supcon_loss (P): {:.6f}".format(supcon_loss_meter.avg))
+        print("domain_loss (G): {:.6f}".format(domain_loss_meter.avg))
+        print("valid_loss: {:.6f}".format(valid_loss))
+
+        result[epoch-1, :] = [acc, mAP, mAUC, optimizer_G.param_groups[0]['lr'], supcon_loss_meter.avg, domain_loss_meter.avg]
+        np.savetxt(exp_dir + '/result.csv', result, delimiter=',')
+        print('validation finished')
+        
+        if mAP > best_mAP:
+            best_mAP = mAP
+            if main_metrics == 'mAP':
+                best_epoch = epoch
+
+        if acc > best_acc:
+            best_acc = acc
+            if main_metrics == 'acc':
+                best_epoch = epoch
+
+        if best_epoch == epoch:
+            torch.save(model.state_dict(), "%s/models/best_audio_model.pth" % (exp_dir))
+            torch.save(optimizer_G.state_dict(), "%s/models/best_optim_state.pth" % (exp_dir))
+        if args.save_model == True:
+            torch.save(model.state_dict(), "%s/models/audio_model.%d.pth" % (exp_dir, epoch))
+        
+        scheduler_P.step()
+        scheduler_G.step()
+            
+        print('Epoch-{0} lr_P: {1} lr_G: {2}'.format(epoch, optimizer_P.param_groups[0]['lr'], optimizer_G.param_groups[0]['lr']))
+        
+        finish_time = time.time()
+        print('epoch {:d} training time: {:.3f}'.format(epoch, finish_time-begin_time))
+
+        epoch += 1
+
+        batch_time.reset()
+        per_sample_time.reset()
+        data_time.reset()
+        per_sample_data_time.reset()
+        per_sample_dnn_time.reset()
+        loss_meter.reset()
+        supcon_loss_meter.reset()
+        domain_loss_meter.reset()
 
 
 def train(model, train_loader, test_loader, args):
@@ -632,7 +983,7 @@ def train(model, train_loader, test_loader, args):
             # print(f"step 2: ", time.time() - start_time)
             # start_time = time.time()
             with autocast():
-                output, _, video_mask, _ = model(a_input, v_input, apply_mask=True, hard_mask=hard_mask, hard_mask_ratio=args.mask_ratio, adversarial=False)
+                output, _, video_mask, _, _ = model(a_input, v_input, apply_mask=True, hard_mask=hard_mask, hard_mask_ratio=args.mask_ratio, adversarial=False)
                 loss = loss_fn(output, labels) + args.mask_loss_lambda * sum(forward_loss_mask(model.module, video_mask))
 
             optimizer.zero_grad()
@@ -754,7 +1105,7 @@ def validate(model, val_loader, args, output_pred=False):
             labels = labels.to(device)
 
             with autocast():
-                audio_output, _, _, _ = model(a_input, v_input, apply_mask=False, adversarial=False)
+                audio_output, _, _, _, _ = model(a_input, v_input, apply_mask=False, adversarial=False)
 
             predictions = audio_output.to('cpu').detach()
 

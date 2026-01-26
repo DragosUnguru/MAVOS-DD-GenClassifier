@@ -401,6 +401,16 @@ class VideoCAVMAEFT(nn.Module):
             num_classes=n_gen_classes,
             drop_rate=[0.5, 0.5]
         )
+        
+        # Projection head for contrastive learning
+        # Maps fused features to a lower-dimensional space for contrastive loss
+        self.projection_dim = 128
+        self.projection_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, self.projection_dim)
+        )
 
     def kl_divergence(self, p, q):
         p = torch.as_tensor(p, dtype=torch.float32)
@@ -429,31 +439,71 @@ class VideoCAVMAEFT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
 
-    def apply_masking(self, x, hard_mask, mask_ratio):
+    def apply_masking(self, x, hard_mask, mask_ratio, use_ste=True):
         """
         x: (B, T, C) visual token embeddings (i.e. from VisualEncoder)
+        hard_mask: if True, use hard binary masking (with STE for gradient flow)
+        mask_ratio: proportion of tokens to mask
+        use_ste: if True and hard_mask=True, use Straight-Through Estimator
+                 to allow gradients to flow through the masking operation
+        
         Returns:
             x_masked: masked embeddings
-            mask: binary mask (1 = masked, 0 = kept)
-            loss_gauss, loss_kl, loss_div: mask regularization losses
+            mask_embedding: soft mask scores from MaskingNet (for regularization loss)
+            ids_restore: indices to restore original order (only for hard_mask without STE)
         """
-        # Train in 2 separate phases:
-        #   - AVFF frozen & train module with soft masking
-        #   - AVFF unfrozen & train with hard masking module
-
-        B, T, _ = x.shape # batch, length, dim
+        B, T, _ = x.shape
         len_keep = int(T * (1 - mask_ratio))
 
         # Predict soft mask scores from MaskingNet
-        mask_embedding = self.masking_net(x)  # (B, L): sigmoid [0, 1]
+        # mask_embedding: (B, T) with values in [0, 1] via sigmoid
+        # Higher value = more likely to be masked
+        mask_embedding = self.masking_net(x)
 
         if not hard_mask:
+            # Soft masking: multiply by (1 - mask_score)
+            # Gradients flow directly through multiplication
             x_masked = x * (1 - mask_embedding.unsqueeze(-1))
-
             return x_masked, mask_embedding, None
+        
+        elif use_ste:
+            # STRAIGHT-THROUGH ESTIMATOR (STE) for hard masking with gradient flow
+            # 
+            # Problem: Hard masking (zeroing out) cuts off gradients
+            # Solution: Forward uses hard mask, backward uses soft mask gradients
+            #
+            # Implementation:
+            #   hard_mask_values = soft_mask + (binary_mask - soft_mask).detach()
+            # 
+            # Forward: hard_mask_values = binary_mask (because detach makes difference constant)
+            # Backward: d(hard_mask_values)/d(soft_mask) = 1 (gradient flows through soft_mask)
+            
+            # Create binary mask via top-k thresholding on soft scores
+            # Top mask_ratio fraction of highest scores become 1 (masked)
+            ids_shuffle = torch.argsort(mask_embedding, dim=1, descending=True)
+            ids_restore = torch.argsort(ids_shuffle, dim=1)
+            
+            # Binary mask: 1 = masked, 0 = kept
+            binary_mask = torch.ones([B, T], device=x.device)
+            binary_mask[:, :len_keep] = 0
+            binary_mask = torch.gather(binary_mask, dim=1, index=ids_restore)
+            
+            # STE: forward uses binary_mask, backward uses mask_embedding gradients
+            # The trick: binary_mask - mask_embedding is detached, so:
+            #   Forward: ste_mask = mask_embedding + (binary_mask - mask_embedding) = binary_mask
+            #   Backward: d(ste_mask)/d(mask_embedding) = 1
+            ste_mask = mask_embedding + (binary_mask - mask_embedding).detach()
+            
+            # Apply hard mask: multiply by (1 - ste_mask)
+            # Where ste_mask=1 (masked), result is 0 (hard zero)
+            # Where ste_mask=0 (kept), result is x (unchanged)
+            x_masked = x * (1 - ste_mask).unsqueeze(-1)
+            
+            return x_masked, mask_embedding, None
+        
         else:
-            # Compute hard binary mask by top-k thresholding
-            ids_shuffle = torch.argsort(mask_embedding, dim=1, descending=True) # descend: small is remove, large is keep
+            # Original hard masking WITHOUT gradient flow (for inference or when not training masking_net)
+            ids_shuffle = torch.argsort(mask_embedding, dim=1, descending=True)
             ids_restore = torch.argsort(ids_shuffle, dim=1)
             ids_keep = ids_shuffle[:, :len_keep]
 
@@ -462,9 +512,9 @@ class VideoCAVMAEFT(nn.Module):
             mask[:, :len_keep] = 0
             mask = torch.gather(mask, dim=1, index=ids_restore)
 
-            # Apply mask (hard masking)
+            # Apply mask (hard masking) - NO gradient flow
             x_masked = x.clone()
-            x_masked[mask.bool()] = 0.0  # zero out masked tokens
+            x_masked[mask.bool()] = 0.0
 
             return x_masked, mask, ids_restore
 
@@ -506,9 +556,15 @@ class VideoCAVMAEFT(nn.Module):
         return x_masked, mask
 
 
-    def forward(self, audio, video, apply_mask=False, masking_mode='learned', hard_mask=False, hard_mask_ratio=0.75, adversarial=False, detach_features_for_gen=False):
+    def forward(self, audio, video, apply_mask=False, masking_mode='learned', hard_mask=False, hard_mask_ratio=0.75, adversarial=False, detach_features_for_gen=False, return_projection=False, use_ste=True):
         # audio: (B, 1024, 128)
         # video: (B, 3, 16, 224, 224)
+        #
+        # use_ste: When True and hard_mask=True, uses Straight-Through Estimator
+        #          to apply hard binary masking (zeros) while preserving gradient flow
+        #          through the masking network. This is crucial for adversarial/contrastive
+        #          training where we want AVFF to see hard-masked inputs (no info leakage)
+        #          but still train the masking network via backprop.
 
         # Forward audio and video through their respective encoders
         audio_emb = self.audio_encoder(audio)
@@ -522,8 +578,9 @@ class VideoCAVMAEFT(nn.Module):
                 video_emb, video_mask = self.apply_random_masking(video_emb, hard_mask_ratio)
                 ids_restore = None
             elif masking_mode == 'learned':
-                # Learned masking via MaskingNet (adversarial training)
-                video_emb, video_mask, ids_restore = self.apply_masking(video_emb, hard_mask, hard_mask_ratio)
+                # Learned masking via MaskingNet
+                # use_ste=True: hard mask in forward, soft mask gradients in backward
+                video_emb, video_mask, ids_restore = self.apply_masking(video_emb, hard_mask, hard_mask_ratio, use_ste=use_ste)
             # else: masking_mode == 'none' - no masking applied
 
         # Rearrange audio and video embeddings to perform temporal complementary mask
@@ -564,7 +621,15 @@ class VideoCAVMAEFT(nn.Module):
                 # Used in Step 2 (generator update) - masking_net learns to fool gen_classifier
                 gen_output = self.gen_classifier(fused_features)
         
-        return output, gen_output, video_mask, ids_restore
+        # Projection head for contrastive learning
+        projection = None
+        if return_projection:
+            if detach_features_for_gen:
+                projection = self.projection_head(fused_features.detach())
+            else:
+                projection = self.projection_head(fused_features)
+        
+        return output, gen_output, video_mask, ids_restore, projection
     
     def set_adversarial_lambda(self, lambda_val):
         """Set the gradient reversal strength for adversarial training."""
@@ -617,4 +682,18 @@ class VideoCAVMAEFT(nn.Module):
         """Unfreeze the generative method classifier head."""
         for name, param in self.named_parameters():
             if "gen_classifier" in name:
+                param.requires_grad = True
+
+
+    def freeze_projection_head(self):
+        """Freeze the projection head for contrastive learning."""
+        for name, param in self.named_parameters():
+            if "projection_head" in name:
+                param.requires_grad = False
+
+
+    def unfreeze_projection_head(self):
+        """Unfreeze the projection head for contrastive learning."""
+        for name, param in self.named_parameters():
+            if "projection_head" in name:
                 param.requires_grad = True

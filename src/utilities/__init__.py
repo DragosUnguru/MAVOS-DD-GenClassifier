@@ -7,3 +7,4 @@
 
 from .util import *
 from .stats import *
+from .contrastive import SupConLoss, DomainConfusionLoss, NTXentLoss, ProjectionHead
