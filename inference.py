@@ -11,24 +11,28 @@ from src.mavosdd_dataset import MavosDD
 
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
-CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/binary_classification_RANDOM_mask_experiment_MINISET_03"
+CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/contrastive_v2_MINISET"
 CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.10.pth"
 DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS.json"
 
-# video_labels = {
-#     "memo": 0,
-#     "liveportrait": 1,
-#     "inswapper": 2,
-#     "echomimic": 3,
-# }
-# audio_labels = {
-#     "knnvc": 4,
-#     "freevc": 5,
-#     "openvoice": 6,
-#     "xtts_v2": 7,
-#     "yourtts": 8,
-# }
-# class_name_to_label_mapping = { **video_labels, **audio_labels }
+# Class mappings for generative methods
+# Video generation methods (indices 0-3)
+video_labels = {
+    "memo": 0,
+    "liveportrait": 1,
+    "inswapper": 2,
+    "echomimic": 3,
+}
+
+# Audio generation methods (indices 4-8)
+audio_labels = {
+    "knnvc": 4,
+    "freevc": 5,
+    "openvoice": 6,
+    "xtts_v2": 7,
+    "yourtts": 8,
+}
+all_labels = {**video_labels, **audio_labels}
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -40,7 +44,10 @@ val_audio_conf = {'num_mel_bins': 128, 'target_length': target_length, 'freqm': 
 
 if __name__ == "__main__":
     # Load model
-    cavmae_ft = VideoCAVMAEFT(n_classes=2)
+    cavmae_ft = VideoCAVMAEFT(
+        n_classes=2,
+        n_gen_classes=len(all_labels),
+    )
     if not isinstance(cavmae_ft, torch.nn.DataParallel):
         cavmae_ft = torch.nn.DataParallel(cavmae_ft)
     cavmae_ft.eval()
@@ -74,12 +81,22 @@ if __name__ == "__main__":
             with autocast():
                 # model_output = torch.round(torch.sigmoid(cavmae_ft(a_input, v_input))).cpu().numpy()
                 # model_output, _, _, _ = cavmae_ft(a_input, v_input, apply_mask=True, hard_mask=True, hard_mask_ratio=0.4, adversarial=True)
-                model_output, _, _, _ = cavmae_ft(
+                # model_output, _, _, _ = cavmae_ft(
+                #     a_input, v_input, 
+                #     apply_mask=True, 
+                #     masking_mode='random',
+                #     hard_mask_ratio=0.4,
+                #     adversarial=False
+                # )
+                model_output, _, _, _, _ = cavmae_ft(
                     a_input, v_input, 
                     apply_mask=True, 
-                    masking_mode='random',
+                    hard_mask=True,  # Hard mask: AVFF sees zeros (no info leakage)
                     hard_mask_ratio=0.4,
-                    adversarial=False
+                    adversarial=False,
+                    detach_features_for_gen=False,  # Gradients flow through to masking_net
+                    return_projection=True,
+                    use_ste=True  # Straight-Through Estimator for gradient flow
                 )
                 model_output = model_output.cpu().numpy()
 

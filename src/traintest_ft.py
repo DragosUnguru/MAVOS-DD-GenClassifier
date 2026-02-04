@@ -734,12 +734,17 @@ def train_contrastive(model, train_loader, test_loader, args):
                 if fake_mask.any() and fake_mask.sum() > 1:
                     # Need at least 2 samples for contrastive loss
                     loss_P = supcon_loss_fn(projection[fake_mask], gen_labels[fake_mask])
+                    has_contrastive_loss = True
                 else:
-                    loss_P = torch.tensor(0.0, device=device, requires_grad=True)
+                    loss_P = torch.tensor(0.0, device=device)
+                    has_contrastive_loss = False
             
-            scaler.scale(loss_P).backward()
-            scaler.step(optimizer_P)
-            scaler.update()
+            # Only perform backward/step if we have a real contrastive loss
+            # Otherwise scaler has no inf checks recorded for this optimizer
+            if has_contrastive_loss:
+                scaler.scale(loss_P).backward()
+                scaler.unscale_(optimizer_P)
+                scaler.step(optimizer_P)
             
             supcon_loss_meter.update(loss_P.item(), B)
             
