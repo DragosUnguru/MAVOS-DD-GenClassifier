@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from src.models.video_cav_mae import VideoCAVMAEFT
+from src.models.video_cav_mae import VideoCAVMAEContrastive, VideoCAVMAEFT
 import numpy as np
 from torch.cuda.amp import autocast
 import json
@@ -11,7 +11,7 @@ from src.mavosdd_dataset import MavosDD
 
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
-CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET_03"
+CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/contrastive_two_steps_adversarial_MINISET"
 CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.10.pth"
 DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS.json"
 
@@ -40,7 +40,12 @@ val_audio_conf = {'num_mel_bins': 128, 'target_length': target_length, 'freqm': 
 
 if __name__ == "__main__":
     # Load model
-    cavmae_ft = VideoCAVMAEFT(n_classes=2)
+    cavmae_ft = VideoCAVMAEContrastive(
+        n_classes=2,
+        temperature=0.07,
+        projection_dim=128,
+    )
+
     if not isinstance(cavmae_ft, torch.nn.DataParallel):
         cavmae_ft = torch.nn.DataParallel(cavmae_ft)
     cavmae_ft.eval()
@@ -72,8 +77,7 @@ if __name__ == "__main__":
             v_input = v_input.to(device)
 
             with autocast():
-                # model_output = torch.round(torch.sigmoid(cavmae_ft(a_input, v_input))).cpu().numpy()
-                model_output, _, _, _ = cavmae_ft(a_input, v_input, apply_mask=True, hard_mask=True, hard_mask_ratio=0.4, adversarial=True)
+                output, _, _ = cavmae_ft(a_input, v_input, apply_mask=False, return_projections=False)
                 model_output = model_output.cpu().numpy()
 
             for y_pred, y_true, video_path in zip(model_output, labels.numpy(), video_paths):

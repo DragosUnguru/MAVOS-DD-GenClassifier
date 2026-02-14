@@ -119,6 +119,7 @@ all_labels = {**video_labels, **audio_labels}
 input_path = "/mnt/d/projects/datasets/MAVOS-DD"
 
 if args.miniset:
+    print("Running with mini training set")
     mavos_dd = get_mini_train_set_deepfake_detection(input_path)
 
     train_loader = DataLoader(
@@ -143,6 +144,7 @@ if args.miniset:
         batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=True
     )
 else:
+    print("Running with full training set")
     mavos_dd = datasets.Dataset.load_from_disk(input_path)
 
     train_loader = DataLoader(

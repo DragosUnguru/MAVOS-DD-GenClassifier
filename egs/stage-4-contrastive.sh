@@ -20,7 +20,7 @@ dataset_mean=-5.081
 dataset_std=4.4849
 target_length=1024
 noise=True
-batch_size=16
+batch_size=8
 lr_adapt=False
 
 n_print_steps=100
@@ -30,7 +30,7 @@ te_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_validation.sv
 
 # exp_dir=./exp/self-pretrain
 # save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3
-save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/contrastive_MINISET
+save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/contrastive_two_steps_adversarial_MINISET
 mkdir -p $save_dir
 mkdir -p ${save_dir}/models
 
@@ -55,4 +55,4 @@ CUDA_CACHE_DISABLE=1 python -W ignore ../src/run_ft_contrastive.py \
     --pretrain_path ${pretrain_path} --num_workers 4 \
     --temperature $TEMPERATURE --projection_dim $PROJECTION_DIM --supcon_weight $SUPCON_WEIGHT \
     --crossmodal_weight $CROSSMODAL_WEIGHT --cls_weight $CLS_WEIGHT --contrastive_weight $CONTRASTIVE_WEIGHT \
-    --n_print_steps 50 --apply_mask True
+    --n_print_steps 50 --apply_mask True --miniset True

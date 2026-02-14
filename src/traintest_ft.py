@@ -631,12 +631,24 @@ def validate_contrastive(model, val_loader, args, output_pred=False):
 
 def train_contrastive(model, train_loader, test_loader, args):
     """
-    Contrastive learning training loop.
+    Adversarial Contrastive Learning training loop with multi-label method support.
     
-    This approach combines:
-    1. Supervised Contrastive Loss: Clusters same-class samples (real vs fake)
-    2. Cross-Modal Contrastive Loss: Aligns audio-video pairs
-    3. Classification Loss: Standard BCE/CE for real/fake prediction
+    Two-pass per iteration:
+    
+    Step 1 (Discriminator - Method Projector):
+        - Freeze masking_net, unfreeze gen_method_projector
+        - Train gen_method_projector to cluster samples by generative method
+        - Uses multi-label supervised contrastive loss (samples can have 2 methods)
+    
+    Step 2 (Generator - Masking Net + Main Task):
+        - Freeze gen_method_projector, unfreeze masking_net + backbone
+        - Train masking_net to FOOL the method projector (adversarial)
+        - Train backbone for real/fake detection using:
+          * Classification loss (BCE/CE)
+          * Supervised contrastive loss (real vs fake clustering)
+    
+    The goal: masking_net learns to mask method-specific artifacts, forcing the
+    backbone to learn GENERAL deepfake features that generalize to unseen methods.
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.set_grad_enabled(True)
@@ -647,11 +659,15 @@ def train_contrastive(model, train_loader, test_loader, args):
     per_sample_data_time = AverageMeter()
     per_sample_dnn_time = AverageMeter()
     
+    # Main task losses
     cls_loss_meter = AverageMeter()
     supcon_loss_meter = AverageMeter()
-    crossmodal_loss_meter = AverageMeter()
-    crossmodal_acc_meter = AverageMeter()
     total_loss_meter = AverageMeter()
+    
+    # Adversarial losses
+    method_loss_meter = AverageMeter()  # Discriminator loss (method clustering)
+    method_acc_meter = AverageMeter()   # Method clustering accuracy
+    adv_loss_meter = AverageMeter()     # Adversarial loss (fool method projector)
     
     best_epoch, best_mAP, best_acc = 0, -np.inf, -np.inf
     global_step, epoch = 0, 0
@@ -663,17 +679,23 @@ def train_contrastive(model, train_loader, test_loader, args):
     
     model.to(device)
     
+    # Get config from args with defaults
+    apply_mask = getattr(args, 'apply_mask', True)
+    mask_ratio = getattr(args, 'mask_ratio', 0.4)
+    lambda_adv = getattr(args, 'lambda_adv', 0.1)
+    lambda_supcon = getattr(args, 'lambda_supcon', 1.0)
+    
     print("="*60)
-    print("Contrastive Learning Training")
+    print("Adversarial Contrastive Learning Training (Multi-Label)")
     print("="*60)
-    print(f"  - Temperature: {args.temperature}")
-    print(f"  - SupCon weight: {args.supcon_weight}")
-    print(f"  - Cross-modal weight: {args.crossmodal_weight}")
     print(f"  - Classification weight: {args.cls_weight}")
-    print(f"  - Overall contrastive weight: {args.contrastive_weight}")
+    print(f"  - SupCon weight: {lambda_supcon}")
+    print(f"  - Adversarial weight: {lambda_adv}")
+    print(f"  - Apply masking: {apply_mask}")
+    print(f"  - Mask ratio: {mask_ratio}")
     print("="*60)
     
-    # Setup parameter groups
+    # Setup parameter groups for different components
     mlp_list = [
         'a2v.mlp.linear.weight', 'a2v.mlp.linear.bias',
         'v2a.mlp.linear.weight', 'v2a.mlp.linear.bias',
@@ -684,34 +706,57 @@ def train_contrastive(model, train_loader, test_loader, args):
         'mlp_head.fc3.weight', 'mlp_head.fc3.bias',
     ]
     
-    # Projection heads should use higher LR (newly initialized)
-    projector_params = []
+    # 1. Gen method projector parameters (discriminator)
+    gen_method_projector_params = list(model.module.gen_method_projector.parameters())
+    
+    # 2. Masking net parameters
+    masking_net_params = list(model.module.masking_net.parameters())
+    
+    # 3. Everything else (backbone + fusion_projector + classifier)
+    gen_method_projector_names = set([f'gen_method_projector.{n}' for n, _ in model.module.gen_method_projector.named_parameters()])
+    masking_net_names = set([f'masking_net.{n}' for n, _ in model.module.masking_net.named_parameters()])
+    
     mlp_params = []
     base_params = []
     
     for name, param in model.module.named_parameters():
         if not param.requires_grad:
             continue
-        if 'projector' in name:
-            projector_params.append(param)
-        elif name in mlp_list:
+        if name in gen_method_projector_names or name in masking_net_names:
+            continue
+        if name in mlp_list or 'projector' in name:
             mlp_params.append(param)
         else:
             base_params.append(param)
     
-    optimizer = torch.optim.Adam([
+    # Optimizer for discriminator (gen_method_projector)
+    optimizer_D = torch.optim.Adam(
+        gen_method_projector_params,
+        lr=args.lr * args.head_lr,
+        weight_decay=5e-7,
+        betas=(0.95, 0.999)
+    )
+    
+    # Optimizer for generator (masking_net + backbone + fusion_projector + classifier)
+    optimizer_G = torch.optim.Adam([
+        {'params': masking_net_params, 'lr': args.lr},
         {'params': base_params, 'lr': args.lr},
         {'params': mlp_params, 'lr': args.lr * args.head_lr},
-        {'params': projector_params, 'lr': args.lr * args.head_lr}
     ], weight_decay=5e-7, betas=(0.95, 0.999))
     
     trainables = [p for p in model.parameters() if p.requires_grad]
     print('Total parameter number: {:.3f} M'.format(sum(p.numel() for p in model.parameters()) / 1e6))
     print('Total trainable parameter number: {:.3f} M'.format(sum(p.numel() for p in trainables) / 1e6))
-    print('Projector parameter number: {:.3f} M'.format(sum(p.numel() for p in projector_params) / 1e6))
+    print('Discriminator (gen_method_projector): {:.3f} M'.format(sum(p.numel() for p in gen_method_projector_params) / 1e6))
+    print('Masking net: {:.3f} M'.format(sum(p.numel() for p in masking_net_params) / 1e6))
     
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer,
+    scheduler_D = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer_D,
+        list(range(args.lrscheduler_start, 1000, args.lrscheduler_step)),
+        gamma=args.lrscheduler_decay
+    )
+    scheduler_G = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer_G,
         list(range(args.lrscheduler_start, 1000, args.lrscheduler_step)),
         gamma=args.lrscheduler_decay
     )
@@ -729,10 +774,10 @@ def train_contrastive(model, train_loader, test_loader, args):
     scaler = GradScaler()
     
     print("current #steps=%s, #epochs=%s" % (global_step, epoch))
-    print("Starting contrastive training...")
+    print("Starting adversarial contrastive training...")
     
-    # Results: acc, mAP, AUC, lr, supcon_loss, crossmodal_loss, crossmodal_acc
-    result = np.zeros([args.n_epochs, 7])
+    # Results: acc, mAP, AUC, lr, supcon_loss, method_loss, adv_loss
+    result = np.zeros([args.n_epochs, 7])  # acc, mAP, mAUC, lr, supcon, method, adv
     model.train()
     
     while epoch < args.n_epochs + 1:
@@ -745,55 +790,105 @@ def train_contrastive(model, train_loader, test_loader, args):
         print("current #epochs=%s, #steps=%s" % (epoch, global_step))
 
         for i, batch in enumerate(tqdm(train_loader)):
-            # Handle both formats
+            # Must have gen_labels for adversarial training
             if len(batch) == 5:
                 a_input, v_input, labels, gen_labels, _ = batch
             else:
-                a_input, v_input, labels, _ = batch
+                raise ValueError("Adversarial contrastive training requires gen_labels (5-element batch)")
             
             B = a_input.shape[0]
             a_input = a_input.to(device, non_blocking=True)
             v_input = v_input.to(device, non_blocking=True)
             labels = labels.to(device)
+            gen_labels = gen_labels.to(device)
 
             data_time.update(time.time() - end_time)
             per_sample_data_time.update((time.time() - end_time) / B)
             dnn_start_time = time.time()
 
-            optimizer.zero_grad()
-
+            # ================================================================
+            # STEP 1: Train Discriminator (gen_method_projector)
+            # Goal: Cluster samples by their generative method (multi-label)
+            # ================================================================
+            model.module.freeze_maskingnet()
+            model.module.unfreeze_gen_method_projector()
+            
+            optimizer_D.zero_grad()
+            
             with autocast():
-                # Forward pass with projections for contrastive loss
+                # Forward pass - get projections with DETACHED features for gen_method_projector
+                # This ensures gradients only flow through gen_method_projector
                 output, video_mask, projections = model(
                     a_input, v_input,
-                    apply_mask=args.apply_mask if hasattr(args, 'apply_mask') else False,
-                    hard_mask=True,
-                    hard_mask_ratio=args.mask_ratio if hasattr(args, 'mask_ratio') else 0.4,
+                    apply_mask=apply_mask,
+                    hard_mask=True,  # Use hard mask for discriminator
+                    hard_mask_ratio=mask_ratio,
                     return_projections=True
                 )
                 
-                # Classification loss
-                cls_loss = loss_fn(output, labels)
-                
-                # Contrastive losses
-                contrastive_loss, loss_dict = model.module.compute_contrastive_losses(
-                    projections, labels,
-                    supcon_weight=args.supcon_weight,
-                    crossmodal_weight=args.crossmodal_weight
+                # Discriminator loss: cluster by generative method (multi-label aware)
+                # Use detached features so gradients only flow through gen_method_projector
+                detached_projections = {
+                    'fused_features': projections['fused_features'].detach()
+                }
+                loss_D, method_acc = model.module.compute_method_discrimination_loss(
+                    detached_projections, gen_labels
+                )
+            
+            scaler.scale(loss_D).backward()
+            scaler.step(optimizer_D)
+            scaler.update()
+            
+            method_loss_meter.update(loss_D.item(), B)
+            method_acc_meter.update(method_acc.item(), B)
+            
+            # ================================================================
+            # STEP 2: Train Generator (masking_net) + Main Task (backbone)
+            # Goals:
+            #   - Masking_net: Fool the gen_method_projector (adversarial)
+            #   - Backbone: Real/fake classification + contrastive clustering
+            # ================================================================
+            model.module.unfreeze_maskingnet()
+            model.module.freeze_gen_method_projector()
+            
+            optimizer_G.zero_grad()
+            
+            with autocast():
+                # Forward pass - gradients flow through masking_net
+                output, video_mask, projections = model(
+                    a_input, v_input,
+                    apply_mask=apply_mask,
+                    hard_mask=False,  # Use soft mask for generator (better gradients)
+                    hard_mask_ratio=mask_ratio,
+                    return_projections=True
                 )
                 
-                # Total loss
-                total_loss = args.cls_weight * cls_loss + args.contrastive_weight * contrastive_loss
-
+                # === Main Task Losses ===
+                
+                # 1. Classification loss (real/fake)
+                cls_loss = loss_fn(output, labels)
+                
+                # 2. Supervised contrastive loss (real vs fake clustering)
+                supcon_loss = model.module.compute_contrastive_loss(projections, labels)
+                
+                # === Adversarial Loss ===
+                
+                # Adversarial loss: FOOL the method projector (multi-label aware)
+                adv_loss, _ = model.module.compute_adversarial_method_loss(
+                    projections, gen_labels
+                )
+                
+                # Total generator loss
+                total_loss = args.cls_weight * cls_loss + lambda_supcon * supcon_loss + lambda_adv * adv_loss
+            
             scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
+            scaler.step(optimizer_G)
             scaler.update()
             
             # Update meters
             cls_loss_meter.update(cls_loss.item(), B)
-            supcon_loss_meter.update(loss_dict['supcon_loss'], B)
-            crossmodal_loss_meter.update(loss_dict['crossmodal_loss'], B)
-            crossmodal_acc_meter.update(loss_dict['crossmodal_acc'], B)
+            supcon_loss_meter.update(supcon_loss.item(), B)
+            adv_loss_meter.update(adv_loss.item(), B)
             total_loss_meter.update(total_loss.item(), B)
             
             batch_time.update(time.time() - end_time)
@@ -806,17 +901,19 @@ def train_contrastive(model, train_loader, test_loader, args):
 
             if print_step and global_step != 0:
                 print('Epoch: [{0}][{1}/{2}]\t'
-                      'Per Sample Time {per_sample_time.avg:.5f}\t'
-                      'Cls Loss {cls_loss.val:.4f}\t'
-                      'SupCon Loss {supcon_loss.val:.4f}\t'
-                      'XModal Loss {xmodal_loss.val:.4f}\t'
-                      'XModal Acc {xmodal_acc.val:.3f}\t'.format(
+                      'Time {per_sample_time.avg:.5f}\t'
+                      'Cls {cls_loss.val:.4f}\t'
+                      'SupCon {supcon_loss.val:.4f}\t'
+                      'Method(D) {method_loss.val:.4f}\t'
+                      'MethodAcc {method_acc.val:.3f}\t'
+                      'Adv(G) {adv_loss.val:.4f}'.format(
                        epoch, i, len(train_loader),
                        per_sample_time=per_sample_time,
                        cls_loss=cls_loss_meter,
                        supcon_loss=supcon_loss_meter,
-                       xmodal_loss=crossmodal_loss_meter,
-                       xmodal_acc=crossmodal_acc_meter), flush=True)
+                       method_loss=method_loss_meter,
+                       method_acc=method_acc_meter,
+                       adv_loss=adv_loss_meter), flush=True)
                 
                 if np.isnan(total_loss_meter.avg):
                     print("Training diverged...")
@@ -840,12 +937,13 @@ def train_contrastive(model, train_loader, test_loader, args):
         print("d_prime: {:.6f}".format(d_prime(mAUC)))
         print("train_cls_loss: {:.6f}".format(cls_loss_meter.avg))
         print("train_supcon_loss: {:.6f}".format(supcon_loss_meter.avg))
-        print("train_crossmodal_loss: {:.6f}".format(crossmodal_loss_meter.avg))
-        print("train_crossmodal_acc: {:.6f}".format(crossmodal_acc_meter.avg))
+        print("train_method_loss (D): {:.6f}".format(method_loss_meter.avg))
+        print("train_method_acc: {:.6f}".format(method_acc_meter.avg))
+        print("train_adv_loss (G): {:.6f}".format(adv_loss_meter.avg))
         print("valid_loss: {:.6f}".format(valid_loss))
 
-        result[epoch-1, :] = [acc, mAP, mAUC, optimizer.param_groups[0]['lr'],
-                              supcon_loss_meter.avg, crossmodal_loss_meter.avg, crossmodal_acc_meter.avg]
+        result[epoch-1, :] = [acc, mAP, mAUC, optimizer_G.param_groups[0]['lr'],
+                              supcon_loss_meter.avg, method_loss_meter.avg, adv_loss_meter.avg]
         np.savetxt(exp_dir + '/result.csv', result, delimiter=',')
         print('Validation finished')
         
@@ -861,13 +959,16 @@ def train_contrastive(model, train_loader, test_loader, args):
 
         if best_epoch == epoch:
             torch.save(model.state_dict(), "%s/models/best_model.pth" % (exp_dir))
-            torch.save(optimizer.state_dict(), "%s/models/best_optim_state.pth" % (exp_dir))
+            torch.save(optimizer_G.state_dict(), "%s/models/best_optim_G_state.pth" % (exp_dir))
+            torch.save(optimizer_D.state_dict(), "%s/models/best_optim_D_state.pth" % (exp_dir))
         if args.save_model:
             torch.save(model.state_dict(), "%s/models/model.%d.pth" % (exp_dir, epoch))
         
-        scheduler.step()
+        scheduler_G.step()
+        scheduler_D.step()
             
-        print('Epoch-{0} lr: {1}'.format(epoch, optimizer.param_groups[0]['lr']))
+        print('Epoch-{0} lr_G: {1} lr_D: {2}'.format(
+            epoch, optimizer_G.param_groups[0]['lr'], optimizer_D.param_groups[0]['lr']))
         
         finish_time = time.time()
         print('Epoch {:d} training time: {:.3f}'.format(epoch, finish_time - begin_time))
@@ -882,6 +983,7 @@ def train_contrastive(model, train_loader, test_loader, args):
         per_sample_dnn_time.reset()
         cls_loss_meter.reset()
         supcon_loss_meter.reset()
-        crossmodal_loss_meter.reset()
-        crossmodal_acc_meter.reset()
+        method_loss_meter.reset()
+        method_acc_meter.reset()
+        adv_loss_meter.reset()
         total_loss_meter.reset()

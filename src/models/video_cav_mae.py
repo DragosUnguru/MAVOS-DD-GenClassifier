@@ -431,42 +431,53 @@ class VideoCAVMAEFT(nn.Module):
 
     def apply_masking(self, x, hard_mask, mask_ratio):
         """
+        Apply learned masking to visual token embeddings.
+        
         x: (B, T, C) visual token embeddings (i.e. from VisualEncoder)
+        
+        For hard_mask=True, uses straight-through estimator to maintain gradient flow:
+        - Forward pass: uses hard binary mask (0 or 1)
+        - Backward pass: gradients flow through soft mask_embedding
+        
         Returns:
             x_masked: masked embeddings
-            mask: binary mask (1 = masked, 0 = kept)
-            loss_gauss, loss_kl, loss_div: mask regularization losses
+            mask: binary mask (1 = masked, 0 = kept) or soft mask
+            ids_restore: indices to restore original order (for hard_mask=True)
         """
-        # Train in 2 separate phases:
-        #   - AVFF frozen & train module with soft masking
-        #   - AVFF unfrozen & train with hard masking module
-
-        B, T, _ = x.shape # batch, length, dim
+        B, T, _ = x.shape  # batch, length, dim
         len_keep = int(T * (1 - mask_ratio))
 
-        # Predict soft mask scores from MaskingNet
-        mask_embedding = self.masking_net(x)  # (B, L): sigmoid [0, 1]
+        # Predict soft mask scores from MaskingNet (values in [0, 1] after sigmoid)
+        mask_embedding = self.masking_net(x)  # (B, T)
 
         if not hard_mask:
+            # Soft masking: differentiable, gradients flow naturally
             x_masked = x * (1 - mask_embedding.unsqueeze(-1))
-
             return x_masked, mask_embedding, None
         else:
-            # Compute hard binary mask by top-k thresholding
-            ids_shuffle = torch.argsort(mask_embedding, dim=1, descending=True) # descend: small is remove, large is keep
+            # Hard masking with straight-through estimator for gradient flow
+            
+            # Sort to find top-k tokens to keep (descending: higher score = more important = keep)
+            ids_shuffle = torch.argsort(mask_embedding, dim=1, descending=True)
             ids_restore = torch.argsort(ids_shuffle, dim=1)
-            ids_keep = ids_shuffle[:, :len_keep]
 
-            # Binary mask (1 = drop, 0 = keep)
-            mask = torch.ones([B, T], device=x.device)
-            mask[:, :len_keep] = 0
-            mask = torch.gather(mask, dim=1, index=ids_restore)
+            # Create hard binary mask (1 = drop, 0 = keep)
+            hard_mask_binary = torch.ones([B, T], device=x.device)
+            hard_mask_binary[:, :len_keep] = 0
+            hard_mask_binary = torch.gather(hard_mask_binary, dim=1, index=ids_restore)
 
-            # Apply mask (hard masking)
-            x_masked = x.clone()
-            x_masked[mask.bool()] = 0.0  # zero out masked tokens
+            # Straight-through estimator:
+            # Forward: use hard_mask_binary (discrete 0/1)
+            # Backward: use mask_embedding (continuous, differentiable)
+            # The trick: hard_mask_binary - mask_embedding.detach() + mask_embedding
+            # This equals hard_mask_binary in forward, but has gradient of mask_embedding in backward
+            soft_mask = mask_embedding  # continuous [0, 1]
+            straight_through_mask = hard_mask_binary - soft_mask.detach() + soft_mask
 
-            return x_masked, mask, ids_restore
+            # Apply mask: multiply by (1 - mask) to zero out masked tokens
+            x_masked = x * (1 - straight_through_mask).unsqueeze(-1)
+
+            return x_masked, hard_mask_binary, ids_restore
 
 
     def forward(self, audio, video, apply_mask=False, hard_mask=False, hard_mask_ratio=0.75, adversarial=False, detach_features_for_gen=False):
@@ -700,11 +711,13 @@ class VideoCAVMAEContrastive(nn.Module):
         # Classification head (real/fake detection)
         self.mlp_head = MLP(input_size=hidden_dim * 2, hidden_size=hidden_dim, num_classes=n_classes)
         
-        # Projection heads for contrastive learning
-        # Separate projectors for each modality and fused representation
-        self.video_projector = ProjectionHead(hidden_dim, hidden_dim // 2, projection_dim)
-        self.audio_projector = ProjectionHead(hidden_dim, hidden_dim // 2, projection_dim)
+        # Projection head for real/fake contrastive clustering
         self.fusion_projector = ProjectionHead(hidden_dim * 2, hidden_dim, projection_dim)
+        
+        # Projector for generative method discrimination (adversarial objective)
+        # This projector learns to cluster samples by their generative method
+        # The masking_net will try to FOOL this projector (adversarial)
+        self.gen_method_projector = ProjectionHead(hidden_dim * 2, hidden_dim, projection_dim)
         
         # MAE masking net specifics (for mask regularization if used)
         self.alpha = -1 / (0.12 * 0.12 * 2)
@@ -720,28 +733,49 @@ class VideoCAVMAEContrastive(nn.Module):
         return torch.sum(p * torch.log(p / q), dim=-1)
 
     def apply_masking(self, x, hard_mask, mask_ratio):
-        """Apply learned masking to visual tokens."""
+        """
+        Apply learned masking to visual tokens.
+        
+        For hard_mask=True, uses straight-through estimator to maintain gradient flow:
+        - Forward pass: uses hard binary mask (0 or 1)
+        - Backward pass: gradients flow through soft mask_embedding
+        
+        This allows the masking_net to learn which tokens to mask while still
+        performing discrete masking during inference.
+        """
         B, T, _ = x.shape
         len_keep = int(T * (1 - mask_ratio))
         
-        mask_embedding = self.masking_net(x)
+        # Predict soft mask scores from MaskingNet (values in [0, 1] after sigmoid)
+        mask_embedding = self.masking_net(x)  # (B, T)
         
         if not hard_mask:
+            # Soft masking: differentiable, gradients flow naturally
             x_masked = x * (1 - mask_embedding.unsqueeze(-1))
             return x_masked, mask_embedding, None
         else:
+            # Hard masking with straight-through estimator for gradient flow
+            
+            # Sort to find top-k tokens to keep (higher score = more important = keep)
             ids_shuffle = torch.argsort(mask_embedding, dim=1, descending=True)
             ids_restore = torch.argsort(ids_shuffle, dim=1)
-            ids_keep = ids_shuffle[:, :len_keep]
             
-            mask = torch.ones([B, T], device=x.device)
-            mask[:, :len_keep] = 0
-            mask = torch.gather(mask, dim=1, index=ids_restore)
+            # Create hard binary mask (1 = drop, 0 = keep)
+            hard_mask_binary = torch.ones([B, T], device=x.device)
+            hard_mask_binary[:, :len_keep] = 0
+            hard_mask_binary = torch.gather(hard_mask_binary, dim=1, index=ids_restore)
             
-            x_masked = x.clone()
-            x_masked[mask.bool()] = 0.0
+            # Straight-through estimator:
+            # Forward: use hard_mask_binary (discrete 0/1)
+            # Backward: use mask_embedding (continuous, differentiable)
+            # This equals hard_mask_binary in forward, but has gradient of mask_embedding in backward
+            soft_mask = mask_embedding  # continuous [0, 1]
+            straight_through_mask = hard_mask_binary - soft_mask.detach() + soft_mask
             
-            return x_masked, mask, ids_restore
+            # Apply mask: multiply by (1 - mask) to zero out masked tokens
+            x_masked = x * (1 - straight_through_mask).unsqueeze(-1)
+            
+            return x_masked, hard_mask_binary, ids_restore
 
     def supervised_contrastive_loss(self, features, labels, temperature=None):
         """
@@ -845,48 +879,6 @@ class VideoCAVMAEContrastive(nn.Module):
         
         return loss, acc
 
-    def info_nce_loss(self, query, positive_key, negative_keys=None, temperature=None):
-        """
-        InfoNCE loss for contrastive learning.
-        
-        Args:
-            query: (B, D) query embeddings
-            positive_key: (B, D) positive key embeddings
-            negative_keys: (N, D) negative key embeddings (optional, uses in-batch negatives if None)
-            temperature: scaling temperature
-        
-        Returns:
-            loss: scalar InfoNCE loss
-        """
-        if temperature is None:
-            temperature = self.temperature
-        
-        # Normalize
-        query = torch.nn.functional.normalize(query, dim=1)
-        positive_key = torch.nn.functional.normalize(positive_key, dim=1)
-        
-        # Positive logits
-        positive_logits = (query * positive_key).sum(dim=1, keepdim=True) / temperature
-        
-        if negative_keys is None:
-            # Use in-batch negatives (all other samples in the batch)
-            negative_keys = positive_key
-        else:
-            negative_keys = torch.nn.functional.normalize(negative_keys, dim=1)
-        
-        # Negative logits
-        negative_logits = torch.matmul(query, negative_keys.T) / temperature
-        
-        # Combine logits
-        logits = torch.cat([positive_logits, negative_logits], dim=1)
-        
-        # Labels: positive is always at index 0
-        labels = torch.zeros(query.shape[0], dtype=torch.long, device=query.device)
-        
-        loss = torch.nn.functional.cross_entropy(logits, labels)
-        
-        return loss
-
     def forward(self, audio, video, apply_mask=False, hard_mask=False, hard_mask_ratio=0.75, 
                 return_projections=False):
         """
@@ -948,51 +940,79 @@ class VideoCAVMAEContrastive(nn.Module):
         projections = None
         if return_projections:
             projections = {
-                'video': self.video_projector(video_features),
-                'audio': self.audio_projector(audio_features),
                 'fusion': self.fusion_projector(fused_features),
-                'video_features': video_features,
-                'audio_features': audio_features,
-                'fused_features': fused_features,
+                'fused_features': fused_features,  # Raw features for gen_method_projector
             }
         
         return output, video_mask, projections
 
-    def compute_contrastive_losses(self, projections, labels, 
-                                    supcon_weight=1.0, 
-                                    crossmodal_weight=0.5):
+    def compute_contrastive_loss(self, projections, labels):
         """
-        Compute all contrastive losses.
+        Compute supervised contrastive loss for real/fake clustering.
+        
+        This is the main contrastive objective: cluster real samples together
+        and fake samples together, regardless of generative method.
         
         Args:
             projections: dict from forward() with return_projections=True
-            labels: (B,) or (B, C) class labels
-            supcon_weight: weight for supervised contrastive loss
-            crossmodal_weight: weight for cross-modal contrastive loss
+            labels: (B, 2) one-hot [is_fake, is_real] or (B,) binary labels
         
         Returns:
-            total_loss: weighted sum of contrastive losses
-            loss_dict: individual losses for logging
+            supcon_loss: supervised contrastive loss
         """
-        # Supervised contrastive on fused features (real vs fake separation)
         supcon_loss = self.supervised_contrastive_loss(
             projections['fusion'], labels
         )
+        return supcon_loss
+    
+    def compute_method_discrimination_loss(self, projections, gen_labels):
+        """
+        Compute the method discrimination loss for adversarial training.
         
-        # Cross-modal contrastive (audio-video alignment)
-        crossmodal_loss, crossmodal_acc = self.cross_modal_contrastive_loss(
-            projections['audio'], projections['video']
-        )
+        This is the DISCRIMINATOR objective: cluster samples by their generative method.
         
-        total_loss = supcon_weight * supcon_loss + crossmodal_weight * crossmodal_loss
+        Args:
+            projections: dict from forward() with return_projections=True
+                         Must contain 'fused_features' key
+            gen_labels: (B, n_methods) multi-hot generative method labels
         
-        loss_dict = {
-            'supcon_loss': supcon_loss.item(),
-            'crossmodal_loss': crossmodal_loss.item(),
-            'crossmodal_acc': crossmodal_acc.item(),
-        }
+        Returns:
+            loss: method contrastive loss
+            method_acc: accuracy of method clustering
+        """
+        # Project fused features through gen_method_projector
+        gen_method_proj = self.gen_method_projector(projections['fused_features'])
         
-        return total_loss, loss_dict
+        # Compute multi-label method contrastive loss
+        loss, method_acc = self.method_contrastive_loss(gen_method_proj, gen_labels)
+        
+        return loss, method_acc
+    
+    def compute_adversarial_method_loss(self, projections, gen_labels):
+        """
+        Compute the adversarial method loss for the generator (masking_net).
+        
+        This is the GENERATOR objective: make samples INDISTINGUISHABLE by method.
+        We want to MAXIMIZE the method contrastive loss (fool the discriminator).
+        
+        Args:
+            projections: dict from forward() with return_projections=True
+            gen_labels: (B, n_methods) multi-hot generative method labels
+        
+        Returns:
+            adv_loss: negative of method contrastive loss (to maximize it)
+            method_acc: accuracy of method clustering (for monitoring)
+        """
+        # Project fused features through gen_method_projector
+        gen_method_proj = self.gen_method_projector(projections['fused_features'])
+        
+        # Compute multi-label method contrastive loss
+        method_loss, method_acc = self.method_contrastive_loss(gen_method_proj, gen_labels)
+        
+        # Adversarial: MAXIMIZE the method loss = MINIMIZE negative of it
+        adv_loss = -method_loss
+        
+        return adv_loss, method_acc
 
     def freeze_backbone(self):
         """Freeze encoder backbone, keep projectors and classifier trainable."""
@@ -1017,3 +1037,177 @@ class VideoCAVMAEContrastive(nn.Module):
         for name, param in self.named_parameters():
             if "masking_net" in name:
                 param.requires_grad = True
+
+    def freeze_gen_method_projector(self):
+        """Freeze the generative method projector (discriminator in adversarial setup)."""
+        for name, param in self.named_parameters():
+            if "gen_method_projector" in name:
+                param.requires_grad = False
+
+    def unfreeze_gen_method_projector(self):
+        """Unfreeze the generative method projector."""
+        for name, param in self.named_parameters():
+            if "gen_method_projector" in name:
+                param.requires_grad = True
+
+    def method_contrastive_loss(self, features, method_labels, temperature=None):
+        """
+        Multi-Label Supervised Contrastive Loss for generative method clustering.
+        
+        This loss handles MULTI-LABEL scenarios where each sample can have multiple
+        generative methods (e.g., 1 audio method + 1 video method = up to 2 labels).
+        
+        Two samples are considered "positive pairs" if they share ANY method in common.
+        The similarity weight is proportional to how many methods they share.
+        
+        Used as the discriminator objective in adversarial training:
+        - Discriminator wants to MINIMIZE this loss (cluster by shared methods)
+        - Masking net wants to MAXIMIZE this loss (make methods indistinguishable)
+        
+        Args:
+            features: (B, D) feature embeddings
+            method_labels: (B, n_methods) multi-hot labels (can have multiple 1s per sample)
+            temperature: scaling temperature
+        
+        Returns:
+            loss: scalar contrastive loss
+            method_acc: accuracy of method clustering (for monitoring)
+        """
+        if temperature is None:
+            temperature = self.temperature
+        
+        device = features.device
+        batch_size = features.shape[0]
+        
+        # Ensure method_labels is multi-hot format (B, n_methods)
+        if method_labels.dim() == 1:
+            raise ValueError("method_labels should be multi-hot (B, n_methods), not class indices")
+        
+        # Normalize features
+        features = torch.nn.functional.normalize(features, dim=1)
+        
+        # Compute similarity matrix
+        similarity_matrix = torch.matmul(features, features.T) / temperature
+        
+        # Compute label similarity: how many methods do samples share?
+        # method_labels: (B, n_methods), each row is multi-hot
+        # label_similarity[i,j] = number of shared methods between sample i and j
+        label_similarity = torch.matmul(method_labels, method_labels.T)  # (B, B)
+        
+        # Create positive mask: samples share at least one method
+        # Weight by number of shared methods (normalized)
+        mask_positives = (label_similarity > 0).float()
+        
+        # Remove self-contrast (diagonal)
+        mask_self = torch.eye(batch_size, device=device)
+        mask_positives = mask_positives * (1 - mask_self)
+        
+        # Optional: weight positives by number of shared labels
+        # This gives higher weight to samples that share MORE methods
+        # Normalize by max possible shared methods (2 in this case)
+        positive_weights = label_similarity * (1 - mask_self)
+        positive_weights = positive_weights / (positive_weights.max() + 1e-6)
+        positive_weights = torch.clamp(positive_weights, min=0)
+        
+        # For numerical stability
+        logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
+        logits = similarity_matrix - logits_max.detach()
+        
+        # Compute log_prob
+        exp_logits = torch.exp(logits) * (1 - mask_self)  # Exclude self
+        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-6)
+        
+        # Compute weighted mean of log-likelihood over positive pairs
+        num_positives = mask_positives.sum(dim=1)
+        has_positives = num_positives > 0
+        num_positives = torch.clamp(num_positives, min=1)
+        
+        # Use positive_weights instead of binary mask for weighted loss
+        weighted_log_prob_pos = (positive_weights * log_prob).sum(dim=1)
+        mean_log_prob_pos = weighted_log_prob_pos / num_positives
+        
+        # Only compute loss for samples that have positive pairs
+        if has_positives.sum() > 0:
+            loss = -mean_log_prob_pos[has_positives].mean()
+        else:
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # Compute method clustering accuracy (for monitoring)
+        # Check if the most similar sample shares at least one method
+        with torch.no_grad():
+            similarity_matrix_masked = similarity_matrix.clone().float()  # Convert to float32 for stability
+            similarity_matrix_masked.fill_diagonal_(float('-inf'))  # Exclude self
+            most_similar = similarity_matrix_masked.argmax(dim=1)
+            
+            # Check if most similar sample shares any method
+            shares_method = label_similarity[torch.arange(batch_size, device=device), most_similar] > 0
+            method_acc = shares_method.float().mean()
+        
+        return loss, method_acc
+
+    def multilabel_real_fake_contrastive_loss(self, features, main_labels, method_labels, temperature=None):
+        """
+        Supervised Contrastive Loss that clusters by real/fake while being
+        METHOD-AGNOSTIC within the fake class.
+        
+        This encourages:
+        - Real samples to cluster together
+        - Fake samples to cluster together REGARDLESS of their generative method
+        
+        This is the OPPOSITE of method_contrastive_loss and helps the backbone
+        learn method-agnostic fake detection features.
+        
+        Args:
+            features: (B, D) feature embeddings
+            main_labels: (B, 2) one-hot [is_fake, is_real] or (B,) binary labels
+            method_labels: (B, n_methods) multi-hot labels (not used for clustering, 
+                          but can be used for weighting/analysis)
+            temperature: scaling temperature
+        
+        Returns:
+            loss: scalar contrastive loss
+        """
+        if temperature is None:
+            temperature = self.temperature
+        
+        device = features.device
+        batch_size = features.shape[0]
+        
+        # Convert main_labels to binary: 0=fake, 1=real
+        if main_labels.dim() > 1:
+            # Assuming format [is_fake, is_real]
+            is_real = main_labels[:, 1]  # 1 if real, 0 if fake
+        else:
+            is_real = main_labels
+        
+        # Normalize features
+        features = torch.nn.functional.normalize(features, dim=1)
+        
+        # Compute similarity matrix
+        similarity_matrix = torch.matmul(features, features.T) / temperature
+        
+        # Create positive mask: same real/fake class
+        is_real = is_real.contiguous().view(-1, 1)
+        mask_positives = torch.eq(is_real, is_real.T).float()
+        
+        # Remove self-contrast
+        mask_self = torch.eye(batch_size, device=device)
+        mask_positives = mask_positives - mask_self
+        
+        # For numerical stability
+        logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
+        logits = similarity_matrix - logits_max.detach()
+        
+        # Compute log_prob
+        exp_logits = torch.exp(logits) * (1 - mask_self)
+        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-6)
+        
+        # Compute mean of log-likelihood over positive pairs
+        num_positives = mask_positives.sum(dim=1)
+        num_positives = torch.clamp(num_positives, min=1)
+        
+        mean_log_prob_pos = (mask_positives * log_prob).sum(dim=1) / num_positives
+        
+        loss = -mean_log_prob_pos.mean()
+        
+        return loss
