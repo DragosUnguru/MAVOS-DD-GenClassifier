@@ -12,8 +12,8 @@ from src.mavosdd_dataset import MavosDD
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
 CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/contrastive_two_steps_adversarial_MINISET"
-CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.10.pth"
-DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.10.PREDICTIONS.json"
+CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/model.10.pth"
+DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/model.10.PREDICTIONS-MASKED.json"
 
 # video_labels = {
 #     "memo": 0,
@@ -66,7 +66,7 @@ if __name__ == "__main__":
             # video_class_name_to_idx=video_labels,
             # audio_class_name_to_idx=audio_labels
         ),
-        batch_size=32, shuffle=False, num_workers=2, pin_memory=False
+        batch_size=32, shuffle=False, num_workers=4, pin_memory=False
     )
 
     A_predictions, A_targets = [], []
@@ -77,7 +77,7 @@ if __name__ == "__main__":
             v_input = v_input.to(device)
 
             with autocast():
-                output, _, _ = cavmae_ft(a_input, v_input, apply_mask=False, return_projections=False)
+                model_output, _, _ = cavmae_ft(a_input, v_input, apply_mask=True, return_projections=False)
                 model_output = model_output.cpu().numpy()
 
             for y_pred, y_true, video_path in zip(model_output, labels.numpy(), video_paths):

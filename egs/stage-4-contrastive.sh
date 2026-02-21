@@ -20,7 +20,7 @@ dataset_mean=-5.081
 dataset_std=4.4849
 target_length=1024
 noise=True
-batch_size=8
+batch_size=9
 lr_adapt=False
 
 n_print_steps=100

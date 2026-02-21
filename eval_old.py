@@ -91,7 +91,7 @@ def evaluate_model(dataset):
     return stats   
     
 if __name__ == "__main__":
-    with open("/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/adversarial_training_2_step_softmask_MINISET_03/eval/audio_model.10.PREDICTIONS.json") as input_json_file:
+    with open("/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/contrastive_two_steps_adversarial_MINISET/eval/model.10.PREDICTIONS-MASKED.json") as input_json_file:
         preds_json = json.load(input_json_file)
 
     mavos_dd = datasets.Dataset.load_from_disk(DATASET_INPUT_PATH)

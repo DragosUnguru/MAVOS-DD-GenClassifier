@@ -1130,7 +1130,9 @@ class VideoCAVMAEContrastive(nn.Module):
         if has_positives.sum() > 0:
             loss = -mean_log_prob_pos[has_positives].mean()
         else:
-            loss = torch.tensor(0.0, device=device, requires_grad=True)
+            # Return a zero loss that's still connected to the computation graph
+            # by multiplying with a sum of the features (maintains gradient flow)
+            loss = (features * 0).sum()
         
         # Compute method clustering accuracy (for monitoring)
         # Check if the most similar sample shares at least one method
