@@ -7,7 +7,7 @@ from models.video_cav_mae import VideoCAVMAEContrastiveRandomMask
 from traintest_ft import train_contrastive_random_mask
 import warnings
 
-from mavosdd_dataset import MavosDD
+from mavosdd_dataset_multiclass import MavosDD
 from mini_datasets import get_mini_train_set_deepfake_detection
 
 
@@ -117,8 +117,8 @@ if args.miniset:
             dataset=mavos_dd,
             input_path=input_path,
             audio_conf=audio_conf,
-            # video_class_name_to_idx=video_labels,
-            # audio_class_name_to_idx=audio_labels,
+            video_class_name_to_idx=video_labels,
+            audio_class_name_to_idx=audio_labels,
             stage=2),
         batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True
     )
@@ -128,8 +128,8 @@ if args.miniset:
             dataset=datasets.Dataset.load_from_disk(input_path).filter(lambda sample: sample['split']=="validation"),
             input_path=input_path,
             audio_conf=val_audio_conf,
-            # video_class_name_to_idx=video_labels,
-            # audio_class_name_to_idx=audio_labels,
+            video_class_name_to_idx=video_labels,
+            audio_class_name_to_idx=audio_labels,
             stage=2),
         batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=True
     )
@@ -143,8 +143,8 @@ else:
             input_path=input_path,
             audio_conf=audio_conf,
             stage=2,
-            # video_class_name_to_idx=video_labels,
-            # audio_class_name_to_idx=audio_labels,
+            video_class_name_to_idx=video_labels,
+            audio_class_name_to_idx=audio_labels,
         ),
         batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True
     )
@@ -155,8 +155,8 @@ else:
             input_path=input_path,
             audio_conf=val_audio_conf,
             stage=2,
-            # video_class_name_to_idx=video_labels,
-            # audio_class_name_to_idx=audio_labels
+            video_class_name_to_idx=video_labels,
+            audio_class_name_to_idx=audio_labels
         ),
         batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, drop_last=True
     )

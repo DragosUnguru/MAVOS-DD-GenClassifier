@@ -1346,14 +1346,21 @@ class VideoCAVMAEContrastiveRandomMask(nn.Module):
 
     def supervised_contrastive_loss(self, features, labels, temperature=None):
         """
-        Supervised Contrastive Loss (SupCon).
+        Multi-Label Supervised Contrastive Loss (SupCon).
         
-        Pulls together samples with the same label while pushing apart samples
-        with different labels in the embedding space.
+        Pulls together samples that share ANY label while pushing apart samples
+        with no labels in common. Supports both single-label and multi-label inputs.
+        
+        For multi-label (e.g., 9 classes with up to 2 active per sample):
+        - Two samples are "positive pairs" if they share at least one label
+        - Positive weight is proportional to the number of shared labels
+        
+        For single-label: reduces to standard SupCon (shares exactly 1 label or 0).
 
         Args:
-            features: (B, D) normalized feature embeddings
-            labels: (B,) or (B, C) class labels (will be converted to class indices)
+            features: (B, D) feature embeddings
+            labels: (B, C) multi-hot labels (can have multiple 1s per sample),
+                    (B, C) one-hot labels, or (B,) class indices
             temperature: scaling temperature (default: self.temperature)
         
         Returns:
@@ -1365,9 +1372,14 @@ class VideoCAVMAEContrastiveRandomMask(nn.Module):
         device = features.device
         batch_size = features.shape[0]
         
-        # Handle one-hot encoded labels
-        if labels.dim() > 1:
-            labels = labels.argmax(dim=1)
+        # Convert scalar labels to one-hot for uniform handling
+        if labels.dim() == 1:
+            # (B,) class indices -> (B, C) one-hot
+            n_classes = labels.max().item() + 1
+            labels = torch.nn.functional.one_hot(labels, n_classes).float()
+        
+        # labels is now (B, C) multi-hot
+        labels = labels.float()
         
         # Normalize features
         features = torch.nn.functional.normalize(features, dim=1)
@@ -1375,13 +1387,24 @@ class VideoCAVMAEContrastiveRandomMask(nn.Module):
         # Compute similarity matrix
         similarity_matrix = torch.matmul(features, features.T) / temperature
         
-        # Create mask for positive pairs (same class)
-        labels = labels.contiguous().view(-1, 1)
-        mask_positives = torch.eq(labels, labels.T).float().to(device)
+        # Compute label overlap: how many labels do samples i and j share?
+        # label_overlap[i,j] = dot product of multi-hot vectors
+        label_overlap = torch.matmul(labels, labels.T)  # (B, B)
+        
+        # Positive mask: samples share at least one label
+        mask_positives = (label_overlap > 0).float()
         
         # Remove self-contrast (diagonal)
         mask_self = torch.eye(batch_size, device=device)
-        mask_positives = mask_positives - mask_self
+        mask_positives = mask_positives * (1 - mask_self)
+        
+        # Weight positives by number of shared labels (normalized)
+        # This gives higher weight to pairs sharing more labels
+        positive_weights = label_overlap * (1 - mask_self)
+        max_overlap = positive_weights.max()
+        if max_overlap > 0:
+            positive_weights = positive_weights / max_overlap
+        positive_weights = torch.clamp(positive_weights, min=0)
         
         # For numerical stability
         logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
@@ -1391,14 +1414,19 @@ class VideoCAVMAEContrastiveRandomMask(nn.Module):
         exp_logits = torch.exp(logits) * (1 - mask_self)  # Exclude self
         log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-6)
         
-        # Compute mean of log-likelihood over positive pairs
+        # Compute weighted mean of log-likelihood over positive pairs
         num_positives = mask_positives.sum(dim=1)
+        has_positives = num_positives > 0
         num_positives = torch.clamp(num_positives, min=1)  # Avoid division by zero
         
-        mean_log_prob_pos = (mask_positives * log_prob).sum(dim=1) / num_positives
+        weighted_log_prob_pos = (positive_weights * log_prob).sum(dim=1)
+        mean_log_prob_pos = weighted_log_prob_pos / num_positives
         
-        # Loss is negative log-likelihood
-        loss = -mean_log_prob_pos.mean()
+        # Only compute loss for samples that have positive pairs
+        if has_positives.sum() > 0:
+            loss = -mean_log_prob_pos[has_positives].mean()
+        else:
+            loss = (features * 0).sum()
         
         return loss
 

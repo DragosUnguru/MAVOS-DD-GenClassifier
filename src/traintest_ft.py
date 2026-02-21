@@ -1128,9 +1128,9 @@ def train_contrastive_random_mask(model, train_loader, test_loader, args):
                 
                 # 1. Classification loss (real/fake)
                 cls_loss = loss_fn(output, labels)
-                
-                # 2. Supervised contrastive loss (real vs fake clustering)
-                supcon_loss = model.module.compute_contrastive_loss(projections, labels)
+
+                # 2. Supervised contrastive loss (gen method clustering)
+                supcon_loss = model.module.compute_contrastive_loss(projections, gen_labels)
                 
                 # Total loss — no adversarial term
                 total_loss = args.cls_weight * cls_loss + lambda_supcon * supcon_loss
