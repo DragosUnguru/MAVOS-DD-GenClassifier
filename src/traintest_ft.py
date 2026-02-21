@@ -987,3 +987,243 @@ def train_contrastive(model, train_loader, test_loader, args):
         method_acc_meter.reset()
         adv_loss_meter.reset()
         total_loss_meter.reset()
+
+
+def train_contrastive_random_mask(model, train_loader, test_loader, args):
+    """
+    Contrastive Learning training loop with RANDOM masking (no learned MaskingNet).
+    
+    Random masking (like dropout over visual tokens)
+    
+    Losses:
+    1. Classification loss (BCE/CE) for real/fake detection
+    2. Supervised contrastive loss for clustering in embedding space
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    torch.set_grad_enabled(True)
+    
+    batch_time = AverageMeter()
+    per_sample_time = AverageMeter()
+    data_time = AverageMeter()
+    per_sample_data_time = AverageMeter()
+    per_sample_dnn_time = AverageMeter()
+    
+    cls_loss_meter = AverageMeter()
+    supcon_loss_meter = AverageMeter()
+    total_loss_meter = AverageMeter()
+    
+    best_epoch, best_mAP, best_acc = 0, -np.inf, -np.inf
+    global_step, epoch = 0, 0
+    start_time = time.time()
+    exp_dir = args.save_dir
+    
+    if not isinstance(model, torch.nn.DataParallel):
+        model = torch.nn.DataParallel(model)
+    
+    model.to(device)
+    
+    apply_mask = getattr(args, 'apply_mask', True)
+    mask_ratio = getattr(args, 'mask_ratio', 0.4)
+    lambda_supcon = getattr(args, 'supcon_weight', 1.0)
+    
+    print("="*60)
+    print("Contrastive Learning with Random Masking (Single-Step)")
+    print("="*60)
+    print(f"  - Classification weight: {args.cls_weight}")
+    print(f"  - SupCon weight: {lambda_supcon}")
+    print(f"  - Apply masking: {apply_mask}")
+    print(f"  - Mask ratio: {mask_ratio}")
+    print(f"  - No MaskingNet — random masking (dropout-style)")
+    print(f"  - No adversarial game — single optimizer")
+    print("="*60)
+    
+    # Single set of parameter groups — no adversarial split needed
+    mlp_list = [
+        'a2v.mlp.linear.weight', 'a2v.mlp.linear.bias',
+        'v2a.mlp.linear.weight', 'v2a.mlp.linear.bias',
+        'mlp_vision.weight', 'mlp_vision.bias',
+        'mlp_audio.weight', 'mlp_audio.bias',
+        'mlp_head.fc1.weight', 'mlp_head.fc1.bias',
+        'mlp_head.fc2.weight', 'mlp_head.fc2.bias',
+        'mlp_head.fc3.weight', 'mlp_head.fc3.bias',
+    ]
+    
+    mlp_params = []
+    base_params = []
+    
+    for name, param in model.module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name in mlp_list or 'projector' in name:
+            mlp_params.append(param)
+        else:
+            base_params.append(param)
+    
+    optimizer = torch.optim.Adam([
+        {'params': base_params, 'lr': args.lr},
+        {'params': mlp_params, 'lr': args.lr * args.head_lr},
+    ], weight_decay=5e-7, betas=(0.95, 0.999))
+    
+    trainables = [p for p in model.parameters() if p.requires_grad]
+    print('Total parameter number: {:.3f} M'.format(sum(p.numel() for p in model.parameters()) / 1e6))
+    print('Total trainable parameter number: {:.3f} M'.format(sum(p.numel() for p in trainables) / 1e6))
+    
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        list(range(args.lrscheduler_start, 1000, args.lrscheduler_step)),
+        gamma=args.lrscheduler_decay
+    )
+    
+    main_metrics = args.metrics
+    
+    if args.loss == 'BCE':
+        loss_fn = nn.BCEWithLogitsLoss()
+    elif args.loss == 'CE':
+        loss_fn = nn.CrossEntropyLoss()
+    args.loss_fn = loss_fn
+    
+    epoch += 1
+    scaler = GradScaler()
+    
+    print("current #steps=%s, #epochs=%s" % (global_step, epoch))
+    print("Starting contrastive training with random masking...")
+    
+    result = np.zeros([args.n_epochs, 5])  # acc, mAP, mAUC, lr, supcon_loss
+    model.train()
+    
+    while epoch < args.n_epochs + 1:
+        begin_time = time.time()
+        end_time = time.time()
+        model.train()
+        
+        print('---------------')
+        print(datetime.datetime.now())
+        print("current #epochs=%s, #steps=%s" % (epoch, global_step))
+
+        for i, batch in enumerate(tqdm(train_loader)):
+            # Support both 4-element and 5-element batches
+            if len(batch) == 5:
+                a_input, v_input, labels, gen_labels, _ = batch
+            else:
+                a_input, v_input, labels, _ = batch
+            
+            B = a_input.shape[0]
+            a_input = a_input.to(device, non_blocking=True)
+            v_input = v_input.to(device, non_blocking=True)
+            labels = labels.to(device)
+
+            data_time.update(time.time() - end_time)
+            per_sample_data_time.update((time.time() - end_time) / B)
+            dnn_start_time = time.time()
+
+            optimizer.zero_grad()
+            
+            with autocast():
+                output, video_mask, projections = model(
+                    a_input, v_input,
+                    apply_mask=apply_mask,
+                    mask_ratio=mask_ratio,
+                    return_projections=True
+                )
+                
+                # 1. Classification loss (real/fake)
+                cls_loss = loss_fn(output, labels)
+                
+                # 2. Supervised contrastive loss (real vs fake clustering)
+                supcon_loss = model.module.compute_contrastive_loss(projections, labels)
+                
+                # Total loss — no adversarial term
+                total_loss = args.cls_weight * cls_loss + lambda_supcon * supcon_loss
+            
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # Update meters
+            cls_loss_meter.update(cls_loss.item(), B)
+            supcon_loss_meter.update(supcon_loss.item(), B)
+            total_loss_meter.update(total_loss.item(), B)
+            
+            batch_time.update(time.time() - end_time)
+            per_sample_time.update((time.time() - end_time) / B)
+            per_sample_dnn_time.update((time.time() - dnn_start_time) / B)
+
+            print_step = global_step % args.n_print_steps == 0
+            early_print_step = epoch == 0 and global_step % (args.n_print_steps/10) == 0
+            print_step = print_step or early_print_step
+
+            if print_step and global_step != 0:
+                print('Epoch: [{0}][{1}/{2}]\t'
+                      'Time {per_sample_time.avg:.5f}\t'
+                      'Cls {cls_loss.val:.4f}\t'
+                      'SupCon {supcon_loss.val:.4f}\t'
+                      'Total {total_loss.val:.4f}'.format(
+                       epoch, i, len(train_loader),
+                       per_sample_time=per_sample_time,
+                       cls_loss=cls_loss_meter,
+                       supcon_loss=supcon_loss_meter,
+                       total_loss=total_loss_meter), flush=True)
+                
+                if np.isnan(total_loss_meter.avg):
+                    print("Training diverged...")
+                    return
+
+            end_time = time.time()
+            global_step += 1
+        
+        print('Starting validation...')
+        stats, valid_loss = validate_contrastive(model, test_loader, args)
+
+        mAP = stats['AP_macro']
+        mAUC = stats['AUC_macro']
+        acc = stats['accuracy']
+
+        if main_metrics == 'mAP':
+            print("mAP: {:.6f}".format(mAP))
+        else:
+            print("acc: {:.6f}".format(acc))
+        print("AUC: {:.6f}".format(mAUC))
+        print("d_prime: {:.6f}".format(d_prime(mAUC)))
+        print("train_cls_loss: {:.6f}".format(cls_loss_meter.avg))
+        print("train_supcon_loss: {:.6f}".format(supcon_loss_meter.avg))
+        print("valid_loss: {:.6f}".format(valid_loss))
+
+        result[epoch-1, :] = [acc, mAP, mAUC, optimizer.param_groups[0]['lr'],
+                              supcon_loss_meter.avg]
+        np.savetxt(exp_dir + '/result.csv', result, delimiter=',')
+        print('Validation finished')
+        
+        if mAP > best_mAP:
+            best_mAP = mAP
+            if main_metrics == 'mAP':
+                best_epoch = epoch
+
+        if acc > best_acc:
+            best_acc = acc
+            if main_metrics == 'acc':
+                best_epoch = epoch
+
+        if best_epoch == epoch:
+            torch.save(model.state_dict(), "%s/models/best_model.pth" % (exp_dir))
+            torch.save(optimizer.state_dict(), "%s/models/best_optim_state.pth" % (exp_dir))
+        if args.save_model:
+            torch.save(model.state_dict(), "%s/models/model.%d.pth" % (exp_dir, epoch))
+        
+        scheduler.step()
+            
+        print('Epoch-{0} lr: {1}'.format(epoch, optimizer.param_groups[0]['lr']))
+        
+        finish_time = time.time()
+        print('Epoch {:d} training time: {:.3f}'.format(epoch, finish_time - begin_time))
+
+        epoch += 1
+
+        # Reset meters
+        batch_time.reset()
+        per_sample_time.reset()
+        data_time.reset()
+        per_sample_data_time.reset()
+        per_sample_dnn_time.reset()
+        cls_loss_meter.reset()
+        supcon_loss_meter.reset()
+        total_loss_meter.reset()

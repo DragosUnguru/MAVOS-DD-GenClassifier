@@ -1213,3 +1213,284 @@ class VideoCAVMAEContrastive(nn.Module):
         loss = -mean_log_prob_pos.mean()
         
         return loss
+
+
+class VideoCAVMAEContrastiveRandomMask(nn.Module):
+    """
+    Video-Audio Contrastive Learning Model for Deepfake Detection with RANDOM masking.
+    
+    Training uses:
+    1. Classification loss (BCE/CE) for real/fake detection
+    2. Supervised contrastive loss for real/fake clustering
+    """
+    def __init__(self, 
+        n_classes=2,
+        img_size=224,
+        patch_size=16, 
+        n_frames=16, 
+        audio_length=1024,
+        mel_bins=128,
+        encoder_embed_dim=768,
+        encoder_depth=12,
+        encoder_num_heads=12,
+        mlp_ratio=4., 
+        qkv_bias=False, 
+        qk_scale=None, 
+        drop_rate=0., 
+        attn_drop_rate=0.,
+        norm_layer="LayerNorm",
+        init_values=0.,
+        tubelet_size=2,
+        norm_pix_loss=True,
+        projection_dim=128,
+        temperature=0.07,
+    ):
+        super().__init__()
+        
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        self.patch_size = patch_size
+        self.norm_pix_loss = norm_pix_loss
+        self.n_frames = n_frames
+        self.n_classes = n_classes
+        self.temperature = temperature
+        self.projection_dim = projection_dim
+
+        # NO MaskingNet — we use random masking instead
+        # NO gen_method_projector — no adversarial game
+        
+        self.audio_encoder = AudioEncoder(
+            audio_length=audio_length,
+            mel_bins=mel_bins,
+            patch_size=patch_size,
+            embed_dim=encoder_embed_dim,
+            num_heads=encoder_num_heads,
+            encoder_depth=encoder_depth,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            drop_rate=drop_rate,
+            attn_drop_rate=attn_drop_rate,
+        )
+        self.visual_encoder = VisualEncoder(
+            img_size=img_size, 
+            patch_size=patch_size, 
+            n_frames=n_frames, 
+            embed_dim=encoder_embed_dim, 
+            depth=encoder_depth,
+            num_heads=encoder_num_heads,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            drop_rate=drop_rate,
+            attn_drop_rate=attn_drop_rate,
+            norm_layer=norm_layer,
+            init_values=init_values,
+            tubelet_size=tubelet_size
+        )
+        self.a2v = A2VNetwork(
+            audio_dim=64 * self.n_frames // 2,
+            visual_dim=196 * self.n_frames // 2,
+            embed_dim=encoder_embed_dim,
+            num_heads=encoder_num_heads
+        )
+        self.v2a = V2ANetwork(
+            audio_dim=64 * self.n_frames // 2,
+            visual_dim=196 * self.n_frames // 2,
+            embed_dim=encoder_embed_dim,
+            num_heads=encoder_num_heads
+        )
+        
+        hidden_dim = 1024
+        self.mlp_vision = torch.nn.Linear(1568, hidden_dim)
+        self.mlp_audio = torch.nn.Linear(512, hidden_dim)
+        
+        # Classification head (real/fake detection)
+        self.mlp_head = MLP(input_size=hidden_dim * 2, hidden_size=hidden_dim, num_classes=n_classes)
+        
+        # Projection head for real/fake contrastive clustering
+        self.fusion_projector = ProjectionHead(hidden_dim * 2, hidden_dim, projection_dim)
+
+    def random_masking(self, x, mask_ratio):
+        """
+        Apply random masking to visual token embeddings, with dropout-style scaling
+        to preserve gradient flow
+        
+        Args:
+            x: (B, T, C) visual token embeddings from VisualEncoder
+            mask_ratio: fraction of tokens to mask (e.g. 0.4 = mask 40% of tokens)
+        
+        Returns:
+            x_masked: (B, T, C) masked and scaled embeddings (same shape as input)
+            mask: (B, T) binary mask (1 = masked/dropped, 0 = kept) for logging
+        """
+        B, T, C = x.shape
+        len_keep = int(T * (1 - mask_ratio))
+        
+        # Generate random noise for each token position, per sample in the batch
+        noise = torch.rand(B, T, device=x.device)  # uniform [0, 1)
+        
+        # Sort noise to get random permutation indices
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        
+        # Create binary mask: 1 = masked (dropped), 0 = kept
+        mask = torch.ones(B, T, device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)  # unshuffle
+        
+        # Apply mask with dropout-style scaling
+        scale = 1.0 / (1.0 - mask_ratio) if mask_ratio < 1.0 else 1.0
+        x_masked = x * (1 - mask).unsqueeze(-1) * scale
+        
+        return x_masked, mask
+
+    def supervised_contrastive_loss(self, features, labels, temperature=None):
+        """
+        Supervised Contrastive Loss (SupCon).
+        
+        Pulls together samples with the same label while pushing apart samples
+        with different labels in the embedding space.
+
+        Args:
+            features: (B, D) normalized feature embeddings
+            labels: (B,) or (B, C) class labels (will be converted to class indices)
+            temperature: scaling temperature (default: self.temperature)
+        
+        Returns:
+            loss: scalar contrastive loss
+        """
+        if temperature is None:
+            temperature = self.temperature
+        
+        device = features.device
+        batch_size = features.shape[0]
+        
+        # Handle one-hot encoded labels
+        if labels.dim() > 1:
+            labels = labels.argmax(dim=1)
+        
+        # Normalize features
+        features = torch.nn.functional.normalize(features, dim=1)
+        
+        # Compute similarity matrix
+        similarity_matrix = torch.matmul(features, features.T) / temperature
+        
+        # Create mask for positive pairs (same class)
+        labels = labels.contiguous().view(-1, 1)
+        mask_positives = torch.eq(labels, labels.T).float().to(device)
+        
+        # Remove self-contrast (diagonal)
+        mask_self = torch.eye(batch_size, device=device)
+        mask_positives = mask_positives - mask_self
+        
+        # For numerical stability
+        logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
+        logits = similarity_matrix - logits_max.detach()
+        
+        # Compute log_prob
+        exp_logits = torch.exp(logits) * (1 - mask_self)  # Exclude self
+        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-6)
+        
+        # Compute mean of log-likelihood over positive pairs
+        num_positives = mask_positives.sum(dim=1)
+        num_positives = torch.clamp(num_positives, min=1)  # Avoid division by zero
+        
+        mean_log_prob_pos = (mask_positives * log_prob).sum(dim=1) / num_positives
+        
+        # Loss is negative log-likelihood
+        loss = -mean_log_prob_pos.mean()
+        
+        return loss
+
+    def forward(self, audio, video, apply_mask=False, mask_ratio=0.4,
+                return_projections=False):
+        """
+        Forward pass with optional random masking and contrastive projections.
+        
+        Args:
+            audio: (B, 1024, 128) mel spectrogram
+            video: (B, 3, 16, 224, 224) video frames
+            apply_mask: whether to apply random masking to visual tokens
+            mask_ratio: fraction of visual tokens to mask (only used if apply_mask=True)
+            return_projections: return projected features for contrastive loss
+        
+        Returns:
+            output: (B, n_classes) classification logits
+            video_mask: (B, T) binary mask for logging (None if apply_mask=False)
+            projections: dict of projected features (None if return_projections=False)
+        """
+        # Encode audio and video
+        audio_emb = self.audio_encoder(audio)
+        video_emb = self.visual_encoder(video)
+        video_mask = None
+
+        # Apply random masking on visual embeddings (dropout-style)
+        if apply_mask and self.training:
+            video_emb, video_mask = self.random_masking(video_emb, mask_ratio)
+
+        # Rearrange for temporal fusion
+        b, t, c = audio_emb.shape
+        audio_emb = audio_emb.reshape(b, self.n_frames // 2, -1, c)
+        b, t, c = video_emb.shape
+        video_emb = video_emb.reshape(b, self.n_frames // 2, -1, c)
+
+        # Cross-modal fusion
+        video_fusion = self.a2v(audio_emb)
+        audio_fusion = self.v2a(video_emb)
+
+        # Concat along feature dimension
+        video_fusion = torch.concat((video_fusion, video_emb), dim=-1)
+        audio_fusion = torch.concat((audio_fusion, audio_emb), dim=-1)
+        video_fusion = video_fusion.mean(dim=-1)
+        audio_fusion = audio_fusion.mean(dim=-1)
+        
+        video_fusion = rearrange(video_fusion, 'b t c -> b (t c)')
+        audio_fusion = rearrange(audio_fusion, 'b t c -> b (t c)')
+        
+        # Project to hidden space
+        video_features = self.mlp_vision(video_fusion)
+        audio_features = self.mlp_audio(audio_fusion)
+        
+        # Fused features for classification
+        fused_features = torch.concat((video_features, audio_features), dim=-1)
+        
+        # Classification output
+        output = self.mlp_head(fused_features)
+        
+        # Compute projections for contrastive learning
+        projections = None
+        if return_projections:
+            projections = {
+                'fusion': self.fusion_projector(fused_features),
+                'fused_features': fused_features,
+            }
+        
+        return output, video_mask, projections
+
+    def compute_contrastive_loss(self, projections, labels):
+        """
+        Compute supervised contrastive loss for real/fake clustering.
+        
+        Args:
+            projections: dict from forward() with return_projections=True
+            labels: (B, 2) one-hot [is_fake, is_real] or (B,) binary labels
+        
+        Returns:
+            supcon_loss: supervised contrastive loss
+        """
+        supcon_loss = self.supervised_contrastive_loss(
+            projections['fusion'], labels
+        )
+        return supcon_loss
+
+    def freeze_backbone(self):
+        """Freeze encoder backbone, keep projector and classifier trainable."""
+        for name, param in self.named_parameters():
+            if any(x in name for x in ['projector', 'mlp_head']):
+                continue
+            param.requires_grad = False
+
+    def unfreeze_backbone(self):
+        """Unfreeze encoder backbone."""
+        for name, param in self.named_parameters():
+            param.requires_grad = True
