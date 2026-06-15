@@ -367,7 +367,7 @@ if __name__ == "__main__":
     # dataset = MavosDD(input_path="/home/eivor/data/MAVOS-DD", audio_conf=audio_conf, stage=2)
     # dataset[0]
 
-    mavos_dd = datasets.Dataset.load_from_disk("/home/eivor/data/MAVOS-DD")
+    mavos_dd = datasets.Dataset.load_from_disk("/mnt/d/projects/datasets/MAVOS-DD")
     
     """
     # Train
@@ -388,11 +388,11 @@ if __name__ == "__main__":
     print(f"Test open: ", len(mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==True and sample["open_set_language"]==True)))
     """
     
-    print(len(mavos_dd))
-    
-    mavos_dd.filter(lambda sample: sample['split']=="train")
+    mavos_dd = mavos_dd.filter(lambda sample: sample['split']=="train")
     
     print(len(mavos_dd))
+    # print(mavos_dd[0])
+    print(set(mavos_dd['generative_method']))
     
     # train_loader = DataLoader(
     #     MavosDD(mavos_dd.filter(lambda sample: sample['split']=="train"), "/home/eivor/data/MAVOS-DD", audio_conf, stage=2),

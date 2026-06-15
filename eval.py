@@ -1,246 +1,236 @@
-import torch
-import numpy as np
+"""
+Evaluation script for VideoCAVMAENoMaskMultiTask.
+Reads predictions JSON produced by inference.py and evaluates across MAVOS-DD splits.
+
+Usage:
+    python eval_old.py \\
+        --predictions_path /path/to/predictions.json \\
+        --dataset_input_path /mnt/d/projects/datasets/MAVOS-DD \\
+        [--plot_confusion]
+"""
+
+import argparse
 import json
+import os
+import numpy as np
+import torch
 import datasets
 import seaborn as sns
-import matplotlib.pyplot as plt
-from sklearn import metrics
-
-from src.utilities.stats import calculate_stats
-
-
 import matplotlib
+import matplotlib.pyplot as plt
+matplotlib.use('Agg')  # Non-interactive backend for headless execution
+from sklearn.metrics import confusion_matrix
+
+from src.utilities.stats import calculate_stats_2
+
 matplotlib.rcParams.update({'font.size': 26})
 
 
-SPLIT_TO_EVALUATE = "closed-set"
-# SPLIT_TO_EVALUATE = "open-model"
-# SPLIT_TO_EVALUATE = "open-language"
-# SPLIT_TO_EVALUATE = "open-set"
-
-DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
-CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp/stage-3"
-CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/audio_model.6.pth"
-INFERENCE_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.6.PREDICTIONS.closed_set.json"
-PLOT_OUT_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/audio_model.6.{SPLIT_TO_EVALUATE}.png"
-
-video_labels = {
-    "memo": 0,
-    "liveportrait": 1,
-    "inswapper": 2,
-    "echomimic": 3,
-}
-audio_labels = {
-    "knnvc": 4,
-    "freevc": 5,
-    "openvoice": 6,
-    "xtts_v2": 7,
-    "yourtts": 8,
-}
-class_name_to_label_mapping = { **video_labels, **audio_labels }
-
-dataset_mean=-5.081
-dataset_std=4.4849
-target_length=1024
-val_audio_conf = {'num_mel_bins': 128, 'target_length': target_length, 'freqm': 0, 'timem': 0, 'mixup': 0,
-                  'mode':'eval', 'mean': dataset_mean, 'std': dataset_std, 'noise': False, 'im_res': 224}
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--predictions_path", type=str, required=True,
+                        help="Path to JSON produced by inference.py")
+    parser.add_argument("--dataset_input_path", type=str,
+                        default="/mnt/d/projects/datasets/MAVOS-DD")
+    parser.add_argument("--plot_confusion", action="store_true",
+                        help="Save confusion matrix plots alongside the JSON")
+    parser.add_argument("--eval_video_gen_method", action="store_true",
+                        help="Evaluate 5-class video generative method instead of binary classification")
+    parser.add_argument("--split", default="test", choices=["test", "validation"])
+    return parser.parse_args()
 
 
-def plot_multilabel_confusion_matrix(y_pred, y_true, class_name_to_label_mapping, normalize=True):
-    """
-    Plot per-class confusion matrices (in percentages) for a multilabel classification problem.
-    
-    Parameters
-    ----------
-    y_pred : list[list[float]] or np.ndarray
-        Model output logits (e.g. the values before applying the final sigmoid activation). Sized as (samples, classes).
-    y_true : list[list[int]] or np.ndarray
-        Ground-truth binary matrix (samples, classes) with values in {0., 1.}.
-    class_name_to_label_mapping : dict
-        Mapping from class name to label index.
-    normalize : bool, default=True
-        If True, display percentages. If False, display raw counts.
-    """
-    y_true = np.array(y_true)
-    y_pred = torch.round(torch.sigmoid(torch.Tensor(y_pred))).cpu().numpy()
-
-    class_names = list(class_name_to_label_mapping.keys())
-    n_classes = len(class_names)
-
-    fig, axes = plt.subplots(
-        nrows=int(np.ceil(n_classes / 3)), ncols=3, 
-        figsize=(15, 4 * np.ceil(n_classes / 3))
-    )
-    axes = axes.flatten()
-    
-    for idx, class_name in enumerate(class_names):
-        cm = metrics.confusion_matrix(y_true[:, idx], y_pred[:, idx])
-
-        if normalize:
-            cm_display = cm.astype("float") / cm.sum() * 100 if cm.sum() > 0 else cm
-            fmt = ".2f"
-            title = "Confusion Matrix (percentages)"
-        else:
-            cm_display = cm
-            fmt = "d"
-            title = "Confusion Matrix (counts)"
-        
-        sns.heatmap(
-            cm_display, annot=True, fmt=fmt, cmap="Blues", 
-            xticklabels=["0", "1"], yticklabels=["0", "1"], 
-            ax=axes[idx], cbar=False
-        )
-        axes[idx].set_title(f"{class_name}")
-        axes[idx].set_xlabel("Predicted")
-        axes[idx].set_ylabel("True")
-    
-    # Hide unused subplots
-    for j in range(idx + 1, len(axes)):
-        fig.delaxes(axes[j])
-
-    # plt.title(title)
-    plt.tight_layout()
-    plt.savefig(PLOT_OUT_PATH)
-    plt.show()
-
-
-def plot_multiclass_confusion_matrix(y_pred, y_true, class_name_to_label_mapping, normalize=True):
-    """
-    Plot a confusion matrix for a multiclass classification problem.
-    Expects one-hot encoded y_true and y_pred (shape: n_samples x n_classes).
-    
-    Parameters
-    ----------
-    y_pred : list[list[float]] or np.ndarray
-        Model output logits (e.g. the values before applying the final sigmoid activation). Sized as (samples, classes).
-    y_true : list[list[int]] or np.ndarray
-        Ground-truth one-hot encoded matrix (samples, classes).
-    class_name_to_label_mapping : dict
-        Mapping from class name to label index.
-    normalize : bool, default=True
-        If True, display percentages. If False, display raw counts.
-    """
-    y_true = np.array(y_true)
-    y_pred = torch.softmax(torch.Tensor(y_pred), dim=1).cpu().numpy()
-
-    # Convert one-hot to class indices
-    y_true_idx = np.argmax(y_true, axis=1)
-    y_pred_idx = np.argmax(y_pred, axis=1)
-
-    class_names = list(class_name_to_label_mapping.keys())
-    
-    # Compute confusion matrix
-    cm = metrics.confusion_matrix(y_true_idx, y_pred_idx, labels=range(len(class_names)))
-
-    if normalize:
-        cm_display = cm.astype("float") / cm.sum() * 100 if cm.sum() > 0 else cm
-        fmt = ".2f"
-        title = "Confusion Matrix (percentages)"
+def plot_confusion_matrix_percent(y_true_idx, y_pred_idx, name="name", save_dir=None, class_labels=None):
+    if class_labels is None:
+        # Binary case
+        class_labels = ["Fake", "Real"]
+        label_names = ["Real" if y == 1 else "Fake" for y in y_true_idx]
+        pred_names  = ["Real" if y == 1 else "Fake" for y in y_pred_idx]
     else:
-        cm_display = cm
-        fmt = "d"
-        title = "Confusion Matrix (counts)"
-    
-    # Plot heatmap
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(
-        cm_display, annot=True, fmt=fmt, cmap="Blues",
-        xticklabels=class_names, yticklabels=class_names, cbar=False
-    )
-    plt.title(title)
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
+        # Multi-class case
+        label_names = [class_labels[int(y)] for y in y_true_idx]
+        pred_names  = [class_labels[int(y)] for y in y_pred_idx]
+
+    cm = confusion_matrix(label_names, pred_names,
+                          labels=class_labels, normalize="true")
+    cm_percent = cm * 100
+
+    figsize = (5, 5) if len(class_labels) == 2 else (8, 8)
+    plt.figure(figsize=figsize)
+    sns.heatmap(cm_percent, annot=True, fmt=".1f", cmap="Blues",
+                xticklabels=class_labels, yticklabels=class_labels,
+                cbar=False)
     plt.tight_layout()
-    plt.savefig(PLOT_OUT_PATH)
-    plt.show()
+
+    if save_dir:
+        import os
+        plt.savefig(os.path.join(save_dir, f"{name}_confusion.png"), dpi=150)
+    plt.close()
+
+
+SPLITS = [
+    "closed-set",
+    "open-model",
+    "open-language",
+    "open-set",
+    "out-of-distribution",
+]
+
+
+def get_split_samples(split_name, split, mavos_dd):
+    closed = mavos_dd.filter(
+        lambda s: s["split"] == split
+        and s["open_set_model"] == False
+        and s["open_set_language"] == False
+    )
+
+    if split_name == "closed-set":
+        return closed
+    elif split_name == "open-model":
+        return datasets.concatenate_datasets([
+            closed,
+            mavos_dd.filter(lambda s: s["split"] == split
+                            and s["open_set_model"] == True
+                            and s["open_set_language"] == False),
+        ])
+    elif split_name == "open-language":
+        return datasets.concatenate_datasets([
+            closed,
+            mavos_dd.filter(lambda s: s["split"] == split
+                            and s["open_set_model"] == False
+                            and s["open_set_language"] == True),
+        ])
+    elif split_name == "open-set":
+        return mavos_dd.filter(lambda s: s["split"] == split)
+    elif split_name == "out-of-distribution":
+        return mavos_dd.filter(
+            lambda s: s["split"] == split
+            and s["generative_method"] in ["hififace", "sonic", "real", "roop"]
+        )
+    else:
+        raise ValueError(f"Unknown split: {split_name}")
 
 
 if __name__ == "__main__":
-    with open(INFERENCE_OUT_PATH) as input_json_file:
-        preds_json = json.load(input_json_file)
+    args = parse_args()
 
-    mavos_dd = datasets.Dataset.load_from_disk(DATASET_INPUT_PATH)
+    with open(args.predictions_path) as f:
+        preds_json = json.load(f)
+    print(f"Loaded {len(preds_json)} predictions from {args.predictions_path}")
 
-    if SPLIT_TO_EVALUATE == "closed-set":
-        curr_split = mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==False and sample["open_set_language"]==False
-                                     and (sample['generative_method'] != 'real' or sample['audio_generative_method'] != 'real'))
-    elif SPLIT_TO_EVALUATE == "open-model":
-        curr_split = datasets.concatenate_datasets([
-            mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==False and sample["open_set_language"]==False),
-            mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==True and sample["open_set_language"]==False)
-        ])
-    elif SPLIT_TO_EVALUATE == "open-language":
-        curr_split = datasets.concatenate_datasets([
-            mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==False and sample["open_set_language"]==False),
-            mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==False and sample["open_set_language"]==True)
-        ])
-    elif SPLIT_TO_EVALUATE == "open-set":
-        curr_split = mavos_dd.filter(lambda sample: sample['split']=="test")
-    else:
-        raise RuntimeError(f"Invalid split given: {SPLIT_TO_EVALUATE}")
+    mavos_dd = datasets.Dataset.load_from_disk(args.dataset_input_path)
+    save_dir = os.path.dirname(args.predictions_path) if args.plot_confusion else None
 
-    y_pred = []
-    y_true = []
-    for sample in curr_split:
-        entry = preds_json[sample["video_path"]]
-        y_pred.append(entry["pred"])
-        y_true.append(entry["true"])
+    results = {}
+    if not args.eval_video_gen_method:
+        for split_name in SPLITS:
+            curr_split = get_split_samples(split_name, args.split, mavos_dd)
 
-    stats = calculate_stats(y_pred, y_true)
+            y_pred, y_true = [], []
+            missing = 0
+            nan_count = 0
+            for sample in curr_split:
+                entry = preds_json.get(sample["video_path"])
+                if entry is None:
+                    missing += 1
+                    continue
+                pred = entry["pred"]
+                if any(not np.isfinite(v) for v in pred):
+                    nan_count += 1
+                    continue
+                y_pred.append(pred)            # 2-logit list  (from inference.py)
+                y_true.append(entry["true"])   # 2-dim one-hot (from inference.py)
 
-    print(f"======= {SPLIT_TO_EVALUATE}: =======")
-    print(f"AUC={list(map(lambda entry: entry['AUC'], stats['per_class']))}")
-    print(f"precisions={list(map(lambda entry: entry['precisions'], stats['per_class']))}")
-    print(f"recalls={list(map(lambda entry: entry['recalls'], stats['per_class']))}")
-    print("===============")
-    print(stats)
+            if missing:
+                print(f"  [warn] {missing} samples not found in predictions — skipped")
+            if nan_count:
+                print(f"  [warn] {nan_count} samples had NaN/Inf logits — skipped")
 
-    multilabel = np.any(np.array(y_true).sum(axis=1) > 1)
+            if not y_pred:
+                print(f"{split_name}: no predictions — skipped\n")
+                continue
 
-    if multilabel:
-        plot_multilabel_confusion_matrix(y_pred, y_true, class_name_to_label_mapping, normalize=False)
-    else:
-        plot_multiclass_confusion_matrix(y_pred, y_true, class_name_to_label_mapping, normalize=False)
+            y_pred_probs = torch.softmax(torch.tensor(y_pred), dim=1)
+            stats = calculate_stats_2(y_pred_probs, torch.tensor(y_true))
 
-"""
-======= audio+video_classes_but_just_video_labels =======
-    classes_to_idx = {
-        'real': 0,
-        'echomimic': 1,
-        'hififace': 2,
-        'inswapper': 3,
-        'liveportrait': 4,
-        'memo': 5,
-        'roop': 6,
-        'sonic': 7,
-    }
+            mAP  = float(np.mean([s["AP"]  for s in stats]))
+            mAUC = float(np.mean([s["auc"] for s in stats]))
+            acc  = float(stats[0]["acc"])
 
---- best_audio_model.pth # closed-set ---
-{
-    "accuracy": 0.9446448917584505,
-    "f1_macro": 0.9271457881657005,
-    "f1_micro": 0.9446448917584505,
-    "precision_per_class": [ 0.944385593220339, 0.9199475065616798, 0.0, 0.9430962343096234, 0.9544554455445544, 0.9603633360858794, 0.0, 0.0 ],
-    "recall_per_class": [ 0.9752051048313582, 0.9272486772486772, 0.0, 0.9166327775518504, 0.7980132450331126, 0.9470684039087948, 0.0, 0.0 ],
-    "f1_per_class": [ 0.9595479415194188, 0.9235836627140975, 0.0, 0.929676221901423, 0.8692515779981965, 0.9536695366953668, 0.0, 0.0 ]
-}
+            results[split_name] = {"mAP": mAP, "mAUC": mAUC, "acc": acc}
+            print(f"{split_name}: mAP={mAP:.4f}, mAUC={mAUC:.4f}, acc={acc:.4f}\n")
 
---- audio_model.10.pth # closed-set ---
-{
-    "mode": "multiclass",
-    "accuracy": 0.9454044815799468,
-    "f1_macro": 0.9294779324126082,
-    "f1_micro": 0.9454044815799468,
-    "AP_macro": 0.6102186724039896,
-    "AP_micro": 0.9855098518064085,
-    "AUC_macro": 0.9930264070226095,
-    "AUC_micro": 0.997000946607545,
-    "precision_per_class: [ 0.9911027950738813, 0.9774638756965911, -0.0, 0.9807828106030021, 0.9410743670411317, 0.9913255308173108, -0.0, -0.0 ]
-    "auc_per_class: [ 0.9916786581701739, 0.9963693344677388, -1, 0.9919814651854895, 0.9864397836609017, 0.998662793628743, -1, -1 ]"
-}
+            if args.plot_confusion:
+                y_pred_idx = np.argmax(y_pred_probs.numpy(), axis=1)
+                y_true_idx = np.argmax(y_true, axis=1)
+                plot_confusion_matrix_percent(y_true_idx, y_pred_idx,
+                                            name=split_name, save_dir=save_dir)
 
-Got precision == 0 for: hififace, roop, sonic
-    hififace -> real/inswapper
-    roop -> real/inswapper
-    sonic -> memo
-"""
+    if args.eval_video_gen_method:
+        print("\n" + "="*60)
+        print("VIDEO GENERATIVE METHOD EVALUATION (5 classes)")
+        print("="*60 + "\n")
+
+        video_gen_labels = ["real", "memo", "liveportrait", "inswapper", "echomimic"]
+        video_gen_label_to_idx = {name: idx for idx, name in enumerate(video_gen_labels)}
+
+        y_pred_vg, y_true_vg = [], []
+        missing_vg = 0
+        nan_count_vg = 0
+
+        for sample in mavos_dd.filter(lambda s: s["split"] == "validation"):
+            entry = preds_json.get(sample["video_path"])
+            if entry is None:
+                missing_vg += 1
+                continue
+            if "video_gen_logits" not in entry:
+                continue
+            logits = entry["video_gen_logits"]
+            if any(not np.isfinite(v) for v in logits):
+                nan_count_vg += 1
+                continue
+            # IMPORTANT: true_gen_label is 9-way (4 video + 5 audio) and does NOT include "real".
+            # For 5-way video-gen head eval, derive ground-truth from dataset generative_method.
+            true_video_method = sample["generative_method"]
+            if len(logits) != 5 or true_video_method not in video_gen_label_to_idx:
+                continue
+
+            true_vec = [0.0] * 5
+            true_vec[video_gen_label_to_idx[true_video_method]] = 1.0
+            y_pred_vg.append(logits)
+            y_true_vg.append(true_vec)
+
+        if missing_vg:
+            print(f"  [warn] {missing_vg} samples not found in predictions — skipped")
+        if nan_count_vg:
+            print(f"  [warn] {nan_count_vg} samples had NaN/Inf logits — skipped")
+
+        if not y_pred_vg:
+            print("No predictions for video gen method — skipped\n")
+        else:
+            stats_vg = calculate_stats_2(torch.tensor(y_pred_vg), torch.tensor(y_true_vg))
+
+            mAP_vg = float(np.mean([s["AP"]  for s in stats_vg]))
+            mAUC_vg = float(np.mean([s["auc"] for s in stats_vg]))
+            acc_vg = float(stats_vg[0]["acc"])
+
+            print(f"Video Gen Method: mAP={mAP_vg:.4f}, mAUC={mAUC_vg:.4f}, acc={acc_vg:.4f}\n")
+            results = {
+                "video_gen_method_validation": {
+                    "mAP": mAP_vg,
+                    "mAUC": mAUC_vg,
+                    "acc": acc_vg,
+                }
+            }
+
+            if args.plot_confusion:
+                y_pred_idx_vg = np.argmax(np.array(y_pred_vg), axis=1)
+                y_true_idx_vg = np.argmax(np.array(y_true_vg), axis=1)
+                plot_confusion_matrix_percent(y_true_idx_vg, y_pred_idx_vg,
+                                              name="video_gen_method", save_dir=save_dir,
+                                              class_labels=video_gen_labels)
+
+    summary_path = args.predictions_path.replace(".json", "_eval_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Summary saved to: {summary_path}")

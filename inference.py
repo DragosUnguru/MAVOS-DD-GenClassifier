@@ -1,33 +1,33 @@
 import torch
 import torch.nn as nn
-from src.models.video_cav_mae import VideoCAVMAEContrastive, VideoCAVMAEFT
+from src.models.video_cav_mae import VideoCAVMAEContrastiveRandomMask, VideoCAVMAEContrastive, VideoCAVMAEFT
 import numpy as np
 from torch.cuda.amp import autocast
 import json
 from tqdm import tqdm
 import datasets
 
-from src.mavosdd_dataset import MavosDD
+from src.mavosdd_dataset_multiclass import MavosDD
 
 
 DATASET_INPUT_PATH = "/mnt/d/projects/datasets/MAVOS-DD"
-CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/contrastive_two_steps_adversarial_MINISET"
-CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/model.10.pth"
-DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/model.10.PREDICTIONS-MASKED.json"
+CHECKPOINT_ROOT_DIR = "/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/contrastive_two_steps_adversarial_gen_method_classification_head_MINISET"
+CHECKPOINT_PATH = f"{CHECKPOINT_ROOT_DIR}/models/model.7.pth"
+DUMP_PATH = f"{CHECKPOINT_ROOT_DIR}/eval/model.7.PREDICTIONS-MASKED.json"
 
-# video_labels = {
-#     "memo": 0,
-#     "liveportrait": 1,
-#     "inswapper": 2,
-#     "echomimic": 3,
-# }
-# audio_labels = {
-#     "knnvc": 4,
-#     "freevc": 5,
-#     "openvoice": 6,
-#     "xtts_v2": 7,
-#     "yourtts": 8,
-# }
+video_labels = {
+    "memo": 0,
+    "liveportrait": 1,
+    "inswapper": 2,
+    "echomimic": 3,
+}
+audio_labels = {
+    "knnvc": 4,
+    "freevc": 5,
+    "openvoice": 6,
+    "xtts_v2": 7,
+    "yourtts": 8,
+}
 # class_name_to_label_mapping = { **video_labels, **audio_labels }
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -41,7 +41,7 @@ val_audio_conf = {'num_mel_bins': 128, 'target_length': target_length, 'freqm': 
 if __name__ == "__main__":
     # Load model
     cavmae_ft = VideoCAVMAEContrastive(
-        n_classes=2,
+        n_classes=5,
         temperature=0.07,
         projection_dim=128,
     )
@@ -63,8 +63,8 @@ if __name__ == "__main__":
             DATASET_INPUT_PATH,
             val_audio_conf,
             stage=2,
-            # video_class_name_to_idx=video_labels,
-            # audio_class_name_to_idx=audio_labels
+            video_class_name_to_idx=video_labels,
+            audio_class_name_to_idx=audio_labels,
         ),
         batch_size=32, shuffle=False, num_workers=4, pin_memory=False
     )
@@ -72,7 +72,7 @@ if __name__ == "__main__":
     A_predictions, A_targets = [], []
     data_out = {}
     with torch.no_grad():
-        for i, (a_input, v_input, labels, video_paths) in tqdm(enumerate(val_loader), total=len(val_loader), desc="Processing data"):
+        for i, (a_input, v_input, labels, gen_labels, video_paths) in tqdm(enumerate(val_loader), total=len(val_loader), desc="Processing data"):
             a_input = a_input.to(device)
             v_input = v_input.to(device)
 

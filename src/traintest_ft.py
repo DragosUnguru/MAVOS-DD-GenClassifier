@@ -578,6 +578,77 @@ def validate(model, val_loader, args, output_pred=False):
         # used for multi-frame evaluation (i.e., ensemble over frames), so return prediction and target
         return stats, audio_output, target
 
+def _extract_video_gen_label(gen_labels, n_video_classes=4):
+    """
+    Convert multi-hot gen_label into a 5-class single-label for video generative method.
+
+    Args:
+        gen_labels: (B, 9) multi-hot tensor; first n_video_classes columns are video methods.
+        n_video_classes: number of video generative method classes (default 4).
+
+    Returns:
+        video_class_idx:  (B,) LongTensor  — 0 = real video, 1..n_video_classes = fake methods
+        video_label_onehot: (B, n_video_classes+1) FloatTensor one-hot
+    """
+    video_gen_part = gen_labels[:, :n_video_classes]          # (B, 4)
+    is_real_video = (video_gen_part.sum(dim=1) == 0)          # (B,)
+    video_class_idx = video_gen_part.argmax(dim=1) + 1        # (B,) — 1-indexed fake classes
+    video_class_idx[is_real_video] = 0                        # real → 0
+    n_classes_total = n_video_classes + 1
+    video_label_onehot = torch.zeros(gen_labels.shape[0], n_classes_total,
+                                     device=gen_labels.device)
+    video_label_onehot.scatter_(1, video_class_idx.unsqueeze(1), 1.0)
+    return video_class_idx, video_label_onehot
+
+
+def validate_contrastive_video_gen(model, val_loader, args, n_video_classes=4, output_pred=False):
+    """
+    Validation for the video-generative-method contrastive model.
+
+    Extracts 5-class video labels from gen_labels and evaluates with CE loss.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch_time = AverageMeter()
+    if not isinstance(model, nn.DataParallel):
+        model = nn.DataParallel(model)
+    model = model.to(device)
+    model.eval()
+
+    end = time.time()
+    A_predictions, A_targets, A_loss = [], [], []
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(val_loader)):
+            a_input, v_input, _main_label, gen_labels, _ = batch
+
+            a_input = a_input.to(device)
+            v_input = v_input.to(device)
+            gen_labels = gen_labels.to(device)
+
+            video_class_idx, video_label_onehot = _extract_video_gen_label(gen_labels, n_video_classes)
+
+            with autocast():
+                output, _, _ = model(a_input, v_input, apply_mask=False, return_projections=False)
+
+            predictions = output.to('cpu').detach()
+            A_predictions.append(predictions)
+            A_targets.append(video_label_onehot.cpu())
+
+            loss = args.loss_fn(output, video_class_idx)
+            A_loss.append(loss.to('cpu').detach())
+
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+        audio_output = torch.cat(A_predictions)
+        target = torch.cat(A_targets)
+        loss = np.mean(A_loss)
+
+        stats = calculate_stats(audio_output.cpu(), target.cpu())
+
+    if not output_pred:
+        return stats, loss
+    else:
+        return stats, audio_output, target
 
 def validate_contrastive(model, val_loader, args, output_pred=False):
     """Validation function for contrastive learning model."""
@@ -1227,3 +1298,596 @@ def train_contrastive_random_mask(model, train_loader, test_loader, args):
         cls_loss_meter.reset()
         supcon_loss_meter.reset()
         total_loss_meter.reset()
+
+def train_contrastive_video_gen(model, train_loader, val_loader, args, n_video_classes=4):
+    """
+    Contrastive training targeting visual generative method classification.
+
+    Instead of real/fake binary detection, this trains a 5-class head:
+        0 = real video
+        1..n_video_classes = video generative method (memo, liveportrait, inswapper, echomimic)
+
+    The adversarial structure is preserved:
+      - Discriminator (gen_method_projector): clusters samples by video generative method.
+      - Generator (masking_net + backbone): fools the discriminator while classifying
+        the video method using CE loss + supervised contrastive loss.
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    torch.set_grad_enabled(True)
+
+    batch_time = AverageMeter()
+    per_sample_time = AverageMeter()
+    data_time = AverageMeter()
+    per_sample_data_time = AverageMeter()
+    per_sample_dnn_time = AverageMeter()
+
+    cls_loss_meter = AverageMeter()
+    supcon_loss_meter = AverageMeter()
+    total_loss_meter = AverageMeter()
+    method_loss_meter = AverageMeter()
+    method_acc_meter = AverageMeter()
+    adv_loss_meter = AverageMeter()
+
+    best_epoch, best_mAP, best_acc = 0, -np.inf, -np.inf
+    global_step, epoch = 0, 0
+    start_time = time.time()
+    exp_dir = args.save_dir
+
+    if not isinstance(model, torch.nn.DataParallel):
+        model = torch.nn.DataParallel(model)
+
+    model.to(device)
+
+    apply_mask = getattr(args, 'apply_mask', True)
+    mask_ratio = getattr(args, 'mask_ratio', 0.4)
+    lambda_adv = getattr(args, 'lambda_adv', 0.1)
+    lambda_supcon = getattr(args, 'lambda_supcon', 1.0)
+
+    n_cls = n_video_classes + 1  # real + video methods
+
+    print("=" * 60)
+    print("Video Generative Method Contrastive Training")
+    print("=" * 60)
+    print(f"  - Num classes (real + video methods): {n_cls}")
+    print(f"  - Classification weight: {args.cls_weight}")
+    print(f"  - SupCon weight: {lambda_supcon}")
+    print(f"  - Adversarial weight: {lambda_adv}")
+    print(f"  - Apply masking: {apply_mask}")
+    print(f"  - Mask ratio: {mask_ratio}")
+    print("=" * 60)
+
+    mlp_list = [
+        'a2v.mlp.linear.weight', 'a2v.mlp.linear.bias',
+        'v2a.mlp.linear.weight', 'v2a.mlp.linear.bias',
+        'mlp_vision.weight', 'mlp_vision.bias',
+        'mlp_audio.weight', 'mlp_audio.bias',
+        'mlp_head.fc1.weight', 'mlp_head.fc1.bias',
+        'mlp_head.fc2.weight', 'mlp_head.fc2.bias',
+        'mlp_head.fc3.weight', 'mlp_head.fc3.bias',
+    ]
+
+    gen_method_projector_params = list(model.module.gen_method_projector.parameters())
+    masking_net_params = list(model.module.masking_net.parameters())
+
+    gen_method_projector_names = set(
+        [f'gen_method_projector.{n}' for n, _ in model.module.gen_method_projector.named_parameters()])
+    masking_net_names = set(
+        [f'masking_net.{n}' for n, _ in model.module.masking_net.named_parameters()])
+
+    mlp_params = []
+    base_params = []
+    for name, param in model.module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name in gen_method_projector_names or name in masking_net_names:
+            continue
+        if name in mlp_list or 'projector' in name:
+            mlp_params.append(param)
+        else:
+            base_params.append(param)
+
+    optimizer_D = torch.optim.Adam(
+        gen_method_projector_params,
+        lr=args.lr * args.head_lr,
+        weight_decay=5e-7,
+        betas=(0.95, 0.999)
+    )
+    optimizer_G = torch.optim.Adam([
+        {'params': masking_net_params, 'lr': args.lr},
+        {'params': base_params, 'lr': args.lr},
+        {'params': mlp_params, 'lr': args.lr * args.head_lr},
+    ], weight_decay=5e-7, betas=(0.95, 0.999))
+
+    trainables = [p for p in model.parameters() if p.requires_grad]
+    print('Total parameter number: {:.3f} M'.format(sum(p.numel() for p in model.parameters()) / 1e6))
+    print('Total trainable parameter number: {:.3f} M'.format(sum(p.numel() for p in trainables) / 1e6))
+
+    scheduler_D = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer_D, list(range(args.lrscheduler_start, 1000, args.lrscheduler_step)),
+        gamma=args.lrscheduler_decay)
+    scheduler_G = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer_G, list(range(args.lrscheduler_start, 1000, args.lrscheduler_step)),
+        gamma=args.lrscheduler_decay)
+
+    main_metrics = args.metrics
+    loss_fn = nn.CrossEntropyLoss()  # single-label multi-class
+    args.loss_fn = loss_fn
+
+    epoch += 1
+    scaler = GradScaler()
+
+    print("current #steps=%s, #epochs=%s" % (global_step, epoch))
+    print("Starting video-gen contrastive training...")
+
+    # acc, mAP, mAUC, lr, supcon, method_D, adv_G
+    result = np.zeros([args.n_epochs, 7])
+    model.train()
+
+    while epoch < args.n_epochs + 1:
+        begin_time = time.time()
+        end_time = time.time()
+        model.train()
+
+        print('---------------')
+        print(datetime.datetime.now())
+        print("current #epochs=%s, #steps=%s" % (epoch, global_step))
+
+        for i, batch in enumerate(tqdm(train_loader)):
+            a_input, v_input, _main_label, gen_labels, _ = batch
+
+            B = a_input.shape[0]
+            a_input = a_input.to(device, non_blocking=True)
+            v_input = v_input.to(device, non_blocking=True)
+            gen_labels = gen_labels.to(device)
+
+            # --- Derive 5-class video labels from gen_labels ---
+            # video_gen_part: (B, 4) — the 4 video method columns
+            video_gen_part = gen_labels[:, :n_video_classes]
+            video_class_idx, video_label_onehot = _extract_video_gen_label(gen_labels, n_video_classes)
+
+            data_time.update(time.time() - end_time)
+            per_sample_data_time.update((time.time() - end_time) / B)
+            dnn_start_time = time.time()
+
+            # ============================================================
+            # STEP 1: Discriminator — cluster by VIDEO generative method
+            # ============================================================
+            model.module.freeze_maskingnet()
+            model.module.unfreeze_gen_method_projector()
+
+            optimizer_D.zero_grad()
+
+            with autocast():
+                output, video_mask, projections = model(
+                    a_input, v_input,
+                    apply_mask=apply_mask,
+                    hard_mask=True,
+                    hard_mask_ratio=mask_ratio,
+                    return_projections=True
+                )
+                # Discriminate using only video-method labels (multi-hot: first 4 cols)
+                detached_projections = {'fused_features': projections['fused_features'].detach()}
+                loss_D, method_acc = model.module.compute_method_discrimination_loss(
+                    detached_projections, video_gen_part
+                )
+
+            scaler.scale(loss_D).backward()
+            scaler.step(optimizer_D)
+            scaler.update()
+
+            method_loss_meter.update(loss_D.item(), B)
+            method_acc_meter.update(method_acc.item(), B)
+
+            # ============================================================
+            # STEP 2: Generator — classify video method + fool discriminator
+            # ============================================================
+            model.module.unfreeze_maskingnet()
+            model.module.freeze_gen_method_projector()
+
+            optimizer_G.zero_grad()
+
+            with autocast():
+                output, video_mask, projections = model(
+                    a_input, v_input,
+                    apply_mask=apply_mask,
+                    hard_mask=False,
+                    hard_mask_ratio=mask_ratio,
+                    return_projections=True
+                )
+
+                # 1. CE classification loss — video generative method (5-class)
+                cls_loss = loss_fn(output, video_class_idx)
+
+                # 2. Supervised contrastive loss — cluster by video method
+                supcon_loss = model.module.compute_contrastive_loss(projections, video_label_onehot)
+
+                # 3. Adversarial loss — fool the video-method discriminator
+                adv_loss, _ = model.module.compute_adversarial_method_loss(
+                    projections, video_gen_part
+                )
+
+                total_loss = args.cls_weight * cls_loss + lambda_supcon * supcon_loss + lambda_adv * adv_loss
+
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer_G)
+            scaler.update()
+
+            cls_loss_meter.update(cls_loss.item(), B)
+            supcon_loss_meter.update(supcon_loss.item(), B)
+            adv_loss_meter.update(adv_loss.item(), B)
+            total_loss_meter.update(total_loss.item(), B)
+
+            batch_time.update(time.time() - end_time)
+            per_sample_time.update((time.time() - end_time) / B)
+            per_sample_dnn_time.update((time.time() - dnn_start_time) / B)
+
+            print_step = global_step % args.n_print_steps == 0
+            early_print_step = epoch == 0 and global_step % (args.n_print_steps / 10) == 0
+            print_step = print_step or early_print_step
+
+            if print_step and global_step != 0:
+                print('Epoch: [{0}][{1}/{2}]\t'
+                      'Time {per_sample_time.avg:.5f}\t'
+                      'Cls {cls_loss.val:.4f}\t'
+                      'SupCon {supcon_loss.val:.4f}\t'
+                      'Method(D) {method_loss.val:.4f}\t'
+                      'MethodAcc {method_acc.val:.3f}\t'
+                      'Adv(G) {adv_loss.val:.4f}'.format(
+                          epoch, i, len(train_loader),
+                          per_sample_time=per_sample_time,
+                          cls_loss=cls_loss_meter,
+                          supcon_loss=supcon_loss_meter,
+                          method_loss=method_loss_meter,
+                          method_acc=method_acc_meter,
+                          adv_loss=adv_loss_meter), flush=True)
+
+                if np.isnan(total_loss_meter.avg):
+                    print("Training diverged...")
+                    return
+
+            end_time = time.time()
+            global_step += 1
+
+        print('Starting validation...')
+        stats, valid_loss = validate_contrastive_video_gen(
+            model, val_loader, args, n_video_classes=n_video_classes)
+
+        mAP = stats['AP_macro']
+        mAUC = stats['AUC_macro']
+        acc = stats['accuracy']
+
+        print("mAP: {:.6f}".format(mAP))
+        print("acc: {:.6f}".format(acc))
+        print("AUC: {:.6f}".format(mAUC))
+        print("d_prime: {:.6f}".format(d_prime(mAUC)))
+        print("train_cls_loss: {:.6f}".format(cls_loss_meter.avg))
+        print("train_supcon_loss: {:.6f}".format(supcon_loss_meter.avg))
+        print("train_method_loss (D): {:.6f}".format(method_loss_meter.avg))
+        print("train_method_acc: {:.6f}".format(method_acc_meter.avg))
+        print("train_adv_loss (G): {:.6f}".format(adv_loss_meter.avg))
+        print("valid_loss: {:.6f}".format(valid_loss))
+
+        result[epoch - 1, :] = [acc, mAP, mAUC, optimizer_G.param_groups[0]['lr'],
+                                 supcon_loss_meter.avg, method_loss_meter.avg, adv_loss_meter.avg]
+        np.savetxt(exp_dir + '/result.csv', result, delimiter=',')
+        print('Validation finished')
+
+        if mAP > best_mAP:
+            best_mAP = mAP
+            if main_metrics == 'mAP':
+                best_epoch = epoch
+
+        if acc > best_acc:
+            best_acc = acc
+            if main_metrics == 'acc':
+                best_epoch = epoch
+
+        if best_epoch == epoch:
+            torch.save(model.state_dict(), "%s/models/best_model.pth" % (exp_dir))
+            torch.save(optimizer_G.state_dict(), "%s/models/best_optim_G_state.pth" % (exp_dir))
+            torch.save(optimizer_D.state_dict(), "%s/models/best_optim_D_state.pth" % (exp_dir))
+        if args.save_model:
+            torch.save(model.state_dict(), "%s/models/model.%d.pth" % (exp_dir, epoch))
+
+        scheduler_G.step()
+        scheduler_D.step()
+
+        print('Epoch-{0} lr_G: {1} lr_D: {2}'.format(
+            epoch, optimizer_G.param_groups[0]['lr'], optimizer_D.param_groups[0]['lr']))
+
+        finish_time = time.time()
+        print('Epoch {:d} training time: {:.3f}'.format(epoch, finish_time - begin_time))
+
+        epoch += 1
+
+        batch_time.reset()
+        per_sample_time.reset()
+        data_time.reset()
+        per_sample_data_time.reset()
+        per_sample_dnn_time.reset()
+        cls_loss_meter.reset()
+        supcon_loss_meter.reset()
+        method_loss_meter.reset()
+        method_acc_meter.reset()
+        adv_loss_meter.reset()
+        total_loss_meter.reset()
+
+def validate_nomask_multitask(model, val_loader, args, n_video_classes=4,
+                              use_video_gen_head=False, use_contrastive=False):
+    """Validation for no-mask multi-task experiments (binary main task)."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not isinstance(model, nn.DataParallel):
+        model = nn.DataParallel(model)
+    model = model.to(device)
+    model.eval()
+
+    A_predictions, A_targets, A_loss = [], [], []
+    video_gen_acc_meter = AverageMeter()
+
+    ce_loss = nn.CrossEntropyLoss()
+
+    with torch.no_grad():
+        for _, batch in enumerate(tqdm(val_loader)):
+            a_input, v_input, main_labels, gen_labels, _ = batch
+            a_input = a_input.to(device)
+            v_input = v_input.to(device)
+            main_labels = main_labels.to(device)
+            gen_labels = gen_labels.to(device)
+
+            binary_targets = main_labels.argmax(dim=1)
+            video_class_idx, video_label_onehot = _extract_video_gen_label(gen_labels, n_video_classes)
+
+            with autocast():
+                binary_logits, video_gen_logits, projections = model(
+                    a_input,
+                    v_input,
+                    return_video_gen_logits=use_video_gen_head,
+                    return_projections=use_contrastive,
+                )
+
+                loss = getattr(args, 'binary_weight', 1.0) * ce_loss(binary_logits, binary_targets)
+                if use_video_gen_head:
+                    loss = loss + getattr(args, 'video_gen_weight', 1.0) * ce_loss(video_gen_logits, video_class_idx)
+                    vg_acc = (video_gen_logits.argmax(dim=1) == video_class_idx).float().mean()
+                    video_gen_acc_meter.update(vg_acc.item(), a_input.shape[0])
+
+                if use_contrastive:
+                    if args.contrastive_mode == "generative_methods":
+                        # Option A (active): SupCon on video generative-method labels.
+                        loss = loss + getattr(args, 'supcon_weight', 1.0) * model.module.compute_contrastive_loss(
+                            projections, video_label_onehot, video_method_ids=video_class_idx
+                        )
+                    else:
+                        # Option B (alternative): SupCon on real/fake labels only.
+                        loss = loss + getattr(args, 'supcon_weight', 1.0) * model.module.compute_contrastive_loss(
+                            projections, main_labels, video_method_ids=video_class_idx
+                        )
+
+            A_predictions.append(binary_logits.to('cpu').detach())
+            A_targets.append(main_labels.to('cpu'))
+            A_loss.append(loss.to('cpu').detach())
+
+    audio_output = torch.cat(A_predictions)
+    target = torch.cat(A_targets)
+    loss = np.mean(A_loss)
+    stats = calculate_stats(audio_output.cpu(), target.cpu())
+    return stats, loss, video_gen_acc_meter.avg
+
+
+def train_nomask_multitask(model, train_loader, val_loader, args, n_video_classes=4):
+    """
+    Train no-mask ablations with a single loop.
+
+    Experiment 1: binary only
+    Experiment 2: binary + video-generative classification
+    Experiment 3: binary + supervised contrastive
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    torch.set_grad_enabled(True)
+
+    use_video_gen_head = getattr(args, 'use_video_gen_head', False)
+    use_contrastive = getattr(args, 'use_contrastive', False)
+
+    batch_time = AverageMeter()
+    cls_loss_meter = AverageMeter()
+    video_gen_loss_meter = AverageMeter()
+    supcon_loss_meter = AverageMeter()
+    total_loss_meter = AverageMeter()
+    video_gen_acc_meter = AverageMeter()
+
+    best_epoch, best_mAP, best_acc = 0, -np.inf, -np.inf
+    global_step, epoch = 0, 1
+    exp_dir = args.save_dir
+
+    if not isinstance(model, torch.nn.DataParallel):
+        model = torch.nn.DataParallel(model)
+    model.to(device)
+
+    ce_loss = nn.CrossEntropyLoss()
+
+    mlp_list = [
+        'a2v.mlp.linear.weight', 'a2v.mlp.linear.bias',
+        'v2a.mlp.linear.weight', 'v2a.mlp.linear.bias',
+        'mlp_vision.weight', 'mlp_vision.bias',
+        'mlp_audio.weight', 'mlp_audio.bias',
+        'binary_head.fc1.weight', 'binary_head.fc1.bias',
+        'binary_head.fc2.weight', 'binary_head.fc2.bias',
+        'binary_head.fc3.weight', 'binary_head.fc3.bias',
+        'video_gen_head.fc1.weight', 'video_gen_head.fc1.bias',
+        'video_gen_head.fc2.weight', 'video_gen_head.fc2.bias',
+        'video_gen_head.fc3.weight', 'video_gen_head.fc3.bias',
+    ]
+
+    mlp_params, base_params = [], []
+    for name, param in model.module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name in mlp_list or 'projector' in name or 'head' in name:
+            mlp_params.append(param)
+        else:
+            base_params.append(param)
+
+    optimizer = torch.optim.Adam([
+        {'params': base_params, 'lr': args.lr},
+        {'params': mlp_params, 'lr': args.lr * args.head_lr},
+    ], weight_decay=5e-7, betas=(0.95, 0.999))
+
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        list(range(args.lrscheduler_start, 1000, args.lrscheduler_step)),
+        gamma=args.lrscheduler_decay
+    )
+
+    print("=" * 60)
+    print("No-Mask Multi-Task Training")
+    print("=" * 60)
+    print(f"  - use_video_gen_head: {use_video_gen_head}")
+    print(f"  - use_contrastive: {use_contrastive}")
+    print(f"  - binary_weight: {getattr(args, 'binary_weight', 1.0)}")
+    print(f"  - video_gen_weight: {getattr(args, 'video_gen_weight', 1.0)}")
+    print(f"  - supcon_weight: {getattr(args, 'supcon_weight', 1.0)}")
+    print("=" * 60)
+
+    result = np.zeros([args.n_epochs, 8])  # acc,mAP,mAUC,lr,cls,video_gen,supcon,total
+    scaler = GradScaler()
+    model.train()
+
+    while epoch < args.n_epochs + 1:
+        begin_time = time.time()
+        end_time = time.time()
+        model.train()
+
+        print('---------------')
+        print(datetime.datetime.now())
+        print("current #epochs=%s, #steps=%s" % (epoch, global_step))
+
+        for i, batch in enumerate(tqdm(train_loader)):
+            a_input, v_input, main_labels, gen_labels, _ = batch
+            B = a_input.shape[0]
+            a_input = a_input.to(device, non_blocking=True)
+            v_input = v_input.to(device, non_blocking=True)
+            main_labels = main_labels.to(device)
+            gen_labels = gen_labels.to(device)
+
+            binary_targets = main_labels.argmax(dim=1)
+            video_class_idx, video_label_onehot = _extract_video_gen_label(gen_labels, n_video_classes)
+
+            optimizer.zero_grad()
+
+            with autocast():
+                binary_logits, video_gen_logits, projections = model(
+                    a_input,
+                    v_input,
+                    return_video_gen_logits=use_video_gen_head,
+                    return_projections=use_contrastive,
+                )
+
+                cls_loss = ce_loss(binary_logits, binary_targets)
+                total_loss = getattr(args, 'binary_weight', 1.0) * cls_loss
+
+                video_gen_loss = torch.zeros((), device=device)
+                if use_video_gen_head:
+                    video_gen_loss = ce_loss(video_gen_logits, video_class_idx)
+                    total_loss = total_loss + getattr(args, 'video_gen_weight', 1.0) * video_gen_loss
+                    vg_acc = (video_gen_logits.argmax(dim=1) == video_class_idx).float().mean()
+                    video_gen_acc_meter.update(vg_acc.item(), B)
+
+                supcon_loss = torch.zeros((), device=device)
+                if use_contrastive:
+                    if args.contrastive_mode == "generative_methods":
+                        # Option A (active): SupCon on video generative-method labels.
+                        supcon_loss = model.module.compute_contrastive_loss(
+                            projections, video_label_onehot, video_method_ids=video_class_idx
+                        )
+                    else:
+                        # Option B (alternative): SupCon on real/fake labels only.
+                        supcon_loss = model.module.compute_contrastive_loss(
+                            projections, main_labels, video_method_ids=video_class_idx
+                        )
+                    total_loss = total_loss + getattr(args, 'supcon_weight', 1.0) * supcon_loss
+
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            cls_loss_meter.update(cls_loss.item(), B)
+            video_gen_loss_meter.update(video_gen_loss.item(), B)
+            supcon_loss_meter.update(supcon_loss.item(), B)
+            total_loss_meter.update(total_loss.item(), B)
+
+            batch_time.update(time.time() - end_time)
+            end_time = time.time()
+            global_step += 1
+
+            if global_step % args.n_print_steps == 0:
+                print('Epoch: [{0}][{1}/{2}]\t'
+                      'Cls {cls_loss.val:.4f}\t'
+                      'VideoGen {video_gen_loss.val:.4f}\t'
+                      'VideoGenAcc {video_gen_acc.avg:.3f}\t'
+                      'SupCon {supcon_loss.val:.4f}\t'
+                      'Total {total_loss.val:.4f}'.format(
+                          epoch, i, len(train_loader),
+                          cls_loss=cls_loss_meter,
+                          video_gen_loss=video_gen_loss_meter,
+                          video_gen_acc=video_gen_acc_meter,
+                          supcon_loss=supcon_loss_meter,
+                          total_loss=total_loss_meter
+                      ), flush=True)
+
+        print('Starting validation...')
+        stats, valid_loss, valid_video_gen_acc = validate_nomask_multitask(
+            model,
+            val_loader,
+            args,
+            n_video_classes=n_video_classes,
+            use_video_gen_head=use_video_gen_head,
+            use_contrastive=use_contrastive,
+        )
+
+        mAP = stats['AP_macro']
+        mAUC = stats['AUC_macro']
+        acc = stats['accuracy']
+
+        print("mAP: {:.6f}".format(mAP))
+        print("acc: {:.6f}".format(acc))
+        print("AUC: {:.6f}".format(mAUC))
+        print("d_prime: {:.6f}".format(d_prime(mAUC)))
+        print("train_cls_loss: {:.6f}".format(cls_loss_meter.avg))
+        print("train_video_gen_loss: {:.6f}".format(video_gen_loss_meter.avg))
+        print("train_video_gen_acc: {:.6f}".format(video_gen_acc_meter.avg))
+        print("train_supcon_loss: {:.6f}".format(supcon_loss_meter.avg))
+        print("valid_video_gen_acc: {:.6f}".format(valid_video_gen_acc))
+        print("valid_loss: {:.6f}".format(valid_loss))
+
+        result[epoch - 1, :] = [
+            acc, mAP, mAUC, optimizer.param_groups[0]['lr'],
+            cls_loss_meter.avg, video_gen_loss_meter.avg, supcon_loss_meter.avg, total_loss_meter.avg
+        ]
+        np.savetxt(exp_dir + '/result.csv', result, delimiter=',')
+
+        if mAP > best_mAP:
+            best_mAP = mAP
+            if args.metrics == 'mAP':
+                best_epoch = epoch
+        if acc > best_acc:
+            best_acc = acc
+            if args.metrics == 'acc':
+                best_epoch = epoch
+
+        if best_epoch == epoch:
+            torch.save(model.state_dict(), "%s/models/best_model.pth" % (exp_dir))
+            torch.save(optimizer.state_dict(), "%s/models/best_optim_state.pth" % (exp_dir))
+        if args.save_model:
+            torch.save(model.state_dict(), "%s/models/model.%d.pth" % (exp_dir, epoch))
+
+        scheduler.step()
+        print('Epoch-{0} lr: {1}'.format(epoch, optimizer.param_groups[0]['lr']))
+        print('Epoch {:d} training time: {:.3f}'.format(epoch, time.time() - begin_time))
+
+        epoch += 1
+        batch_time.reset()
+        cls_loss_meter.reset()
+        video_gen_loss_meter.reset()
+        supcon_loss_meter.reset()
+        total_loss_meter.reset()
+        video_gen_acc_meter.reset()

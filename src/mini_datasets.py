@@ -80,14 +80,19 @@ def get_mini_train_set_deepfake_detection(input_path: str) -> DataLoader:
 
 if __name__ == "__main__":
     import shutil
+    import json
     input_path = "/mnt/d/projects/datasets/MAVOS-DD"
     mavos = get_mini_train_set_deepfake_detection(input_path)
-    source_dir = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp"
-    destination_dir = "/mnt/d/projects/MAVOS-DD-GenClassifer/subset"
-    for sample in mavos:
-        if sample['label']=='fake':
-            video_path = sample['video_path']
-            source_video_path = os.path.join(source_dir, video_path[:-4], "heatmap_grayscale.npy")
-            destination_video_path = os.path.join(destination_dir, video_path[:-4], "heatmap_grayscale.npy")
-            os.makedirs(os.path.join(destination_dir, video_path[:-4]), exist_ok=True)
-            shutil.copy(source_video_path, destination_video_path)
+    print(mavos[0])
+    # with open('/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd-train-miniset.csv', 'w') as file_handler:
+    #     for entry in mavos:
+    #         file_handler.write(json.dumps(entry))
+    # source_dir = "/mnt/d/projects/MAVOS-DD-GenClassifer/exp"
+    # destination_dir = "/mnt/d/projects/MAVOS-DD-GenClassifer/subset"
+    # for sample in mavos:
+    #     if sample['label']=='fake':
+    #         video_path = sample['video_path']
+    #         source_video_path = os.path.join(source_dir, video_path[:-4], "heatmap_grayscale.npy")
+    #         destination_video_path = os.path.join(destination_dir, video_path[:-4], "heatmap_grayscale.npy")
+    #         os.makedirs(os.path.join(destination_dir, video_path[:-4]), exist_ok=True)
+    #         shutil.copy(source_video_path, destination_video_path)

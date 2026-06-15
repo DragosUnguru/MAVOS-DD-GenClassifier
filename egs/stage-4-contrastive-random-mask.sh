@@ -21,7 +21,7 @@ n_print_steps=50
 tr_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_train.csv
 te_data=/mnt/d/projects/MAVOS-DD-GenClassifer/data/mavos-dd_validation.csv
 
-save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/contrastive_random_mask_MINISET
+save_dir=/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/contrastive_random_mask_dropout_MINISET
 mkdir -p $save_dir
 mkdir -p ${save_dir}/models
 

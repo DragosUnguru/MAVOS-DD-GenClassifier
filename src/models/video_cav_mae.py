@@ -835,50 +835,6 @@ class VideoCAVMAEContrastive(nn.Module):
         
         return loss
 
-    def cross_modal_contrastive_loss(self, audio_features, video_features, temperature=None):
-        """
-        Cross-modal contrastive loss (similar to CLIP).
-        
-        Encourages audio and video embeddings from the same sample to be similar,
-        while embeddings from different samples should be dissimilar.
-        
-        Args:
-            audio_features: (B, D) audio embeddings
-            video_features: (B, D) video embeddings
-            temperature: scaling temperature
-        
-        Returns:
-            loss: scalar contrastive loss
-            accuracy: matching accuracy
-        """
-        if temperature is None:
-            temperature = self.temperature
-        
-        # Normalize features
-        audio_features = torch.nn.functional.normalize(audio_features, dim=1)
-        video_features = torch.nn.functional.normalize(video_features, dim=1)
-        
-        batch_size = audio_features.shape[0]
-        
-        # Compute similarity matrix
-        logits = torch.matmul(audio_features, video_features.T) / temperature
-        
-        # Labels are diagonal (audio[i] should match video[i])
-        labels = torch.arange(batch_size, device=audio_features.device)
-        
-        # Symmetric loss (audio->video and video->audio)
-        loss_a2v = torch.nn.functional.cross_entropy(logits, labels)
-        loss_v2a = torch.nn.functional.cross_entropy(logits.T, labels)
-        loss = (loss_a2v + loss_v2a) / 2
-        
-        # Compute accuracy
-        with torch.no_grad():
-            pred_a2v = logits.argmax(dim=1)
-            pred_v2a = logits.T.argmax(dim=1)
-            acc = ((pred_a2v == labels).float().mean() + (pred_v2a == labels).float().mean()) / 2
-        
-        return loss, acc
-
     def forward(self, audio, video, apply_mask=False, hard_mask=False, hard_mask_ratio=0.75, 
                 return_projections=False):
         """
@@ -1214,6 +1170,225 @@ class VideoCAVMAEContrastive(nn.Module):
         
         return loss
 
+class VideoCAVMAENoMaskMultiTask(nn.Module):
+    """
+    No-masking variant for ablation experiments.
+
+    Supports three setups:
+      1) Binary head only
+      2) Binary + video generative method head
+      3) Binary + contrastive loss
+
+    Notes:
+      - No `masking_net`
+      - No adversarial two-step training
+    """
+    def __init__(self,
+        n_binary_classes=2,
+        n_video_gen_classes=5,
+        use_video_gen_head=True,
+        img_size=224,
+        patch_size=16,
+        n_frames=16,
+        audio_length=1024,
+        mel_bins=128,
+        encoder_embed_dim=768,
+        encoder_depth=12,
+        encoder_num_heads=12,
+        mlp_ratio=4.,
+        qkv_bias=False,
+        qk_scale=None,
+        drop_rate=0.,
+        attn_drop_rate=0.,
+        norm_layer="LayerNorm",
+        init_values=0.,
+        tubelet_size=2,
+        norm_pix_loss=True,
+        projection_dim=128,
+        temperature=0.07,
+    ):
+        super().__init__()
+
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.patch_size = patch_size
+        self.norm_pix_loss = norm_pix_loss
+        self.n_frames = n_frames
+        self.temperature = temperature
+        self.use_video_gen_head = use_video_gen_head
+
+        self.audio_encoder = AudioEncoder(
+            audio_length=audio_length,
+            mel_bins=mel_bins,
+            patch_size=patch_size,
+            embed_dim=encoder_embed_dim,
+            num_heads=encoder_num_heads,
+            encoder_depth=encoder_depth,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            drop_rate=drop_rate,
+            attn_drop_rate=attn_drop_rate,
+        )
+        self.visual_encoder = VisualEncoder(
+            img_size=img_size,
+            patch_size=patch_size,
+            n_frames=n_frames,
+            embed_dim=encoder_embed_dim,
+            depth=encoder_depth,
+            num_heads=encoder_num_heads,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            drop_rate=drop_rate,
+            attn_drop_rate=attn_drop_rate,
+            norm_layer=norm_layer,
+            init_values=init_values,
+            tubelet_size=tubelet_size
+        )
+        self.a2v = A2VNetwork(
+            audio_dim=64 * self.n_frames // 2,
+            visual_dim=196 * self.n_frames // 2,
+            embed_dim=encoder_embed_dim,
+            num_heads=encoder_num_heads
+        )
+        self.v2a = V2ANetwork(
+            audio_dim=64 * self.n_frames // 2,
+            visual_dim=196 * self.n_frames // 2,
+            embed_dim=encoder_embed_dim,
+            num_heads=encoder_num_heads
+        )
+
+        hidden_dim = 1024
+        self.mlp_vision = torch.nn.Linear(1568, hidden_dim)
+        self.mlp_audio = torch.nn.Linear(512, hidden_dim)
+
+        self.binary_head = MLP(input_size=hidden_dim * 2, hidden_size=hidden_dim, num_classes=n_binary_classes)
+        if self.use_video_gen_head:
+            self.video_gen_head = MLP(input_size=hidden_dim * 2, hidden_size=hidden_dim, num_classes=n_video_gen_classes)
+        else:
+            self.video_gen_head = None
+        # self.fusion_projector = ProjectionHead(hidden_dim * 2, hidden_dim, projection_dim)
+
+    def forward(self, audio, video, return_video_gen_logits=False, return_projections=False):
+        audio_emb = self.audio_encoder(audio)
+        video_emb = self.visual_encoder(video)
+
+        b, t, c = audio_emb.shape
+        audio_emb = audio_emb.reshape(b, self.n_frames // 2, -1, c)
+        b, t, c = video_emb.shape
+        video_emb = video_emb.reshape(b, self.n_frames // 2, -1, c)
+
+        video_fusion = self.a2v(audio_emb)
+        audio_fusion = self.v2a(video_emb)
+
+        video_fusion = torch.concat((video_fusion, video_emb), dim=-1)
+        audio_fusion = torch.concat((audio_fusion, audio_emb), dim=-1)
+        video_fusion = video_fusion.mean(dim=-1)
+        audio_fusion = audio_fusion.mean(dim=-1)
+
+        video_fusion = rearrange(video_fusion, 'b t c -> b (t c)')
+        audio_fusion = rearrange(audio_fusion, 'b t c -> b (t c)')
+
+        video_features = self.mlp_vision(video_fusion)
+        audio_features = self.mlp_audio(audio_fusion)
+        fused_features = torch.concat((video_features, audio_features), dim=-1)
+
+        binary_logits = self.binary_head(fused_features)
+
+        if return_video_gen_logits and self.video_gen_head is None:
+            raise ValueError("return_video_gen_logits=True but the model was instantiated without a video generative head")
+
+        video_gen_logits = self.video_gen_head(fused_features) if return_video_gen_logits else None
+
+        projections = None
+        if return_projections:
+            projections = {
+                'fused_features': fused_features,
+            }
+
+        return binary_logits, video_gen_logits, projections
+
+    def supervised_contrastive_loss(self, features, labels, video_method_ids=None, temperature=None):
+        """
+        Supervised contrastive loss.
+
+        Optionally skips pairs that come from the SAME video generative method
+        (same class id out of 5: 0=real, 1..4=fake methods), regardless of whether
+        labels are real/fake or generative-method labels.
+
+        Args:
+            features:          (B, D) — fused feature embeddings (pre-normalisation).
+            labels:            (B, 2) one-hot or (B,) int — real/fake labels.
+            video_method_ids:  (B,) LongTensor — 0 = real, 1..N = video fake method.
+                               When provided, same-method pairs are excluded from both
+                               positives and the denominator.
+            temperature:       scalar, defaults to self.temperature.
+        """
+        if temperature is None:
+            temperature = self.temperature
+
+        device = features.device
+        batch_size = features.shape[0]
+
+        if labels.dim() > 1:
+            labels = labels.argmax(dim=1)
+
+        features = torch.nn.functional.normalize(features, dim=1)
+        similarity_matrix = torch.matmul(features, features.T) / temperature
+
+        labels = labels.contiguous().view(-1, 1)
+        mask_self = torch.eye(batch_size, device=device)
+
+        # Positive mask: same real/fake class, excluding self-pairs
+        mask_positives = torch.eq(labels, labels.T).float().to(device)
+        mask_positives = mask_positives * (1 - mask_self)
+
+        # All off-diagonal pairs are initially valid for the denominator
+        valid_pairs = 1 - mask_self  # (B, B)
+
+        if video_method_ids is not None:
+            # Skip same-method pairs only (0=real, 1..N=fake methods).
+            ids = video_method_ids.long().to(device)          # (B,)
+            same_method = torch.eq(ids.unsqueeze(1), ids.unsqueeze(0)).float() # (B, B)
+            ignore = same_method                              # (B, B)
+            valid_pairs    = valid_pairs    * (1 - ignore)
+            mask_positives = mask_positives * (1 - ignore)
+
+        # Numerical stability (canonical SupCon style): subtract per-row max.
+        logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
+        logits = similarity_matrix - logits_max.detach()
+
+        # Denominator includes only valid pairs (self and ignored pairs are excluded)
+        exp_logits = torch.exp(logits) * valid_pairs
+        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-6)
+
+        # Canonical edge-case handling: anchors with no positive pairs contribute 0.
+        mask_pos_pairs = mask_positives.sum(dim=1)
+        mask_pos_pairs = torch.where(
+            mask_pos_pairs < 1e-6,
+            torch.ones_like(mask_pos_pairs),
+            mask_pos_pairs,
+        )
+        mean_log_prob_pos = (mask_positives * log_prob).sum(dim=1) / mask_pos_pairs
+        loss = -mean_log_prob_pos.mean()
+
+        return loss
+
+    def compute_contrastive_loss(self, projections, labels, video_method_ids=None):
+        """
+        Compute SupCon loss on fused_features.
+
+        Args:
+            projections:      dict with key 'fused_features' — (B, D) float32 tensor.
+            labels:           (B, C) one-hot or (B,) int class labels.
+            video_method_ids: (B,) LongTensor — 0 = real, 1..N = video fake method.
+                              Same-method pairs are ignored.
+        """
+        return self.supervised_contrastive_loss(
+            projections['fused_features'],
+            labels,
+            video_method_ids=video_method_ids,
+        )
+
 
 class VideoCAVMAEContrastiveRandomMask(nn.Module):
     """
@@ -1379,7 +1554,7 @@ class VideoCAVMAEContrastiveRandomMask(nn.Module):
             labels = torch.nn.functional.one_hot(labels, n_classes).float()
         
         # labels is now (B, C) multi-hot
-        labels = labels.float()
+        labels = labels.float().to(device)
         
         # Normalize features
         features = torch.nn.functional.normalize(features, dim=1)
@@ -1453,7 +1628,7 @@ class VideoCAVMAEContrastiveRandomMask(nn.Module):
         video_mask = None
 
         # Apply random masking on visual embeddings (dropout-style)
-        if apply_mask and self.training:
+        if apply_mask:
             video_emb, video_mask = self.random_masking(video_emb, mask_ratio)
 
         # Rearrange for temporal fusion

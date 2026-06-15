@@ -91,7 +91,7 @@ def evaluate_model(dataset):
     return stats   
     
 if __name__ == "__main__":
-    with open("/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/contrastive_two_steps_adversarial_MINISET/eval/model.10.PREDICTIONS-MASKED.json") as input_json_file:
+    with open("/mnt/d/projects/MAVOS-DD-GenClassifer/checkpoints/contrastive_random_mask_dropout_MINISET/eval/model.10.PREDICTIONS-MASKED.json") as input_json_file:
         preds_json = json.load(input_json_file)
 
     mavos_dd = datasets.Dataset.load_from_disk(DATASET_INPUT_PATH)
@@ -100,11 +100,7 @@ if __name__ == "__main__":
     #            name=f"Baseline")
     split_closed_set = mavos_dd.filter(lambda sample: sample['split']=="test" and sample['open_set_model']==False and sample["open_set_language"]==False)
 
-    split_to_evaluate = "closed-set"
-    split_to_evaluate = "open-model"
-    split_to_evaluate = "open-language"
-    split_to_evaluate = "open-set"
-    for split_to_evaluate in ["closed-set", "open-model", "open-language",  "open-set"]:
+    for split_to_evaluate in ["closed-set", "open-model", "open-language",  "open-set", "out-of-distribution"]:
         if split_to_evaluate == "closed-set":
             # Test closed-set
             curr_split = split_closed_set
@@ -123,6 +119,9 @@ if __name__ == "__main__":
         elif split_to_evaluate == "open-set":
             # Open set
             curr_split = mavos_dd.filter(lambda sample: sample['split']=="test")
+        elif split_to_evaluate == "out-of-distribution":
+            # Out of distribution generative method (video)s
+            curr_split = mavos_dd.filter(lambda sample: sample['split']=="test" and sample['generative_method'] in ['hififace', 'sonic', 'real', 'roop'])
 
         y_pred = []
         y_true = []
